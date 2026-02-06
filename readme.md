@@ -2,6 +2,16 @@
 
 Rust WASM turn-based 1v1 PvP dueling game.
 
+## Docs
+
+- Docs Index: `docs/index.md`
+- Overview: `docs/overview.md`
+- Architecture: `docs/architecture.md`
+- Methodology (DTI): `docs/methodology.md`
+- TODO: `docs/todo.md`
+- Notes: `docs/notes.md`
+- Documentation Standards: `documentation_standards.md`
+
 ## Dev
 
 Use Trunk to build and serve the app:
