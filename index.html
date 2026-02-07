@@ -5,62 +5,76 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Beyond vs Below</title>
     <link data-trunk rel="rust" />
+    <link data-trunk rel="copy-dir" href="assets" />
     <style>
       :root {
-        color-scheme: light;
+        color-scheme: dark;
       }
 
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
       body {
+        width: 100%;
+        height: 100%;
         margin: 0;
         padding: 0;
+        overflow: hidden;
+        background: #070c12;
         font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino,
           "Times New Roman", serif;
-        background: radial-gradient(circle at top, #f4efe6 0%, #e6dccd 40%, #c2b39b 100%);
-        color: #251a0f;
-        min-height: 100vh;
+      }
+
+      #gl-canvas {
+        display: block;
+        width: 100vw;
+        height: 100vh;
+        touch-action: none;
+      }
+
+      #diagnostics {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        max-width: min(92vw, 520px);
+        background: rgba(5, 10, 16, 0.78);
+        color: #c6ecff;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid rgba(142, 196, 255, 0.25);
+        font-family: "SFMono-Regular", "Menlo", "Monaco", "Consolas", "Liberation Mono",
+          "Courier New", monospace;
+        font-size: 12px;
+        line-height: 1.4;
+        white-space: pre-wrap;
+      }
+
+      #fallback {
+        position: fixed;
+        inset: 0;
         display: grid;
         place-items: center;
-      }
-
-      main {
+        color: #f3d9b1;
         text-align: center;
-        padding: 3rem 2.5rem;
-        border: 1px solid rgba(37, 26, 15, 0.2);
-        border-radius: 16px;
-        background: rgba(255, 255, 255, 0.6);
-        box-shadow: 0 20px 40px rgba(37, 26, 15, 0.18);
+        padding: 2rem;
+        background: radial-gradient(circle at top, #202733 0%, #070c12 60%);
       }
 
-      h1 {
-        margin: 0 0 0.75rem;
-        font-size: clamp(2.5rem, 4vw, 3.5rem);
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-      }
-
-      #status {
-        margin: 0;
-        font-size: 1.1rem;
+      #fallback[hidden] {
+        display: none;
       }
     </style>
   </head>
   <body>
-    <main>
-      <h1>Beyond vs Below</h1>
-      <p id="status">Loading arena...</p>
-    </main>
-    <script type="module">
-      addEventListener("TrunkApplicationStarted", () => {
-        const status = document.getElementById("status");
-        if (!status) return;
-
-        const bindings = window.wasmBindings;
-        if (bindings && typeof bindings.greet === "function") {
-          status.textContent = bindings.greet("Duelist");
-        } else {
-          status.textContent = "WASM loaded.";
-        }
-      });
-    </script>
+    <canvas id="gl-canvas" aria-label="Beyond vs Below title screen"></canvas>
+    <div id="diagnostics" role="status" aria-live="polite">Initializing…</div>
+    <div id="fallback" hidden>
+      <div>
+        <h1>Beyond vs Below</h1>
+        <p>WebGL is unavailable on this browser. Try a different device or browser.</p>
+      </div>
+    </div>
   </body>
 </html>
