@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-diag-open="0">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -36,9 +36,11 @@
 
       #diagnostics {
         position: fixed;
-        top: 12px;
-        left: 12px;
+        top: 64px;
+        right: 12px;
         max-width: min(92vw, 520px);
+        max-height: min(62vh, 460px);
+        overflow: auto;
         background: rgba(5, 10, 16, 0.78);
         color: #c6ecff;
         padding: 10px 12px;
@@ -49,6 +51,56 @@
         font-size: 12px;
         line-height: 1.4;
         white-space: pre-wrap;
+        transform-origin: top right;
+        transition: opacity 160ms ease, transform 160ms ease;
+        z-index: 40;
+      }
+
+      html[data-diag-open="0"] #diagnostics {
+        opacity: 0;
+        transform: translateY(-8px) scale(0.98);
+        pointer-events: none;
+      }
+
+      html[data-diag-open="1"] #diagnostics {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+        pointer-events: auto;
+      }
+
+      #tools-button {
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        width: 44px;
+        height: 44px;
+        display: grid;
+        place-items: center;
+        border-radius: 12px;
+        border: 1px solid rgba(142, 196, 255, 0.35);
+        background: rgba(5, 10, 16, 0.62);
+        color: #c6ecff;
+        cursor: pointer;
+        z-index: 50;
+        -webkit-tap-highlight-color: transparent;
+      }
+
+      #tools-button:hover {
+        background: rgba(10, 18, 28, 0.74);
+      }
+
+      #tools-button:active {
+        transform: translateY(1px);
+      }
+
+      #tools-button[aria-expanded="true"] {
+        border-color: rgba(255, 196, 142, 0.55);
+        box-shadow: 0 0 0 3px rgba(255, 196, 142, 0.12);
+      }
+
+      #tools-button svg {
+        width: 22px;
+        height: 22px;
       }
 
       #fallback {
@@ -69,6 +121,33 @@
   </head>
   <body>
     <canvas id="gl-canvas" aria-label="Beyond vs Below title screen"></canvas>
+    <button
+      id="tools-button"
+      type="button"
+      aria-label="Toggle diagnostics"
+      aria-controls="diagnostics"
+      aria-expanded="false"
+      title="Diagnostics"
+    >
+      <!-- Oscilloscope icon (diagnostics/instrumentation) -->
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path
+          d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v13A2.5 2.5 0 0 1 17.5 21h-11A2.5 2.5 0 0 1 4 18.5v-13Z"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.7"
+          stroke-linejoin="round"
+        />
+        <path
+          d="M6.5 14h2.2l1.1-4.1 2.2 8.2 1.4-5.1h3.1"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.7"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+    </button>
     <div id="diagnostics" role="status" aria-live="polite">Initializing…</div>
     <div id="fallback" hidden>
       <div>

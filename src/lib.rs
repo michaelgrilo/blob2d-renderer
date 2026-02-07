@@ -4,9 +4,9 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{
-    Document, Event, HtmlCanvasElement, HtmlDivElement, HtmlImageElement, WebGlBuffer,
-    WebGlProgram, WebGlRenderingContext as Gl, WebGlShader, WebGlTexture, WebGlUniformLocation,
-    Window,
+    Document, Event, HtmlButtonElement, HtmlCanvasElement, HtmlDivElement, HtmlImageElement,
+    WebGlBuffer, WebGlProgram, WebGlRenderingContext as Gl, WebGlShader, WebGlTexture,
+    WebGlUniformLocation, Window,
 };
 
 const VERTEX_SHADER_SOURCE: &str = r#"
@@ -52,6 +52,8 @@ struct AppState {
     u_texture: WebGlUniformLocation,
     canvas: HtmlCanvasElement,
     diagnostics: HtmlDivElement,
+    tools_button: HtmlButtonElement,
+    diagnostics_open: bool,
     fallback: Option<HtmlDivElement>,
     image: HtmlImageElement,
     image_loaded: bool,
@@ -136,6 +138,32 @@ fn set_status(document: &Document, diagnostics: &HtmlDivElement, status: &str, m
         let _ = el.set_attribute("data-render-status", status);
     }
     diagnostics.set_text_content(Some(message));
+}
+
+fn set_diagnostics_open(document: &Document, state: &mut AppState, open: bool) {
+    state.diagnostics_open = open;
+
+    if let Some(el) = document.document_element() {
+        let _ = el.set_attribute("data-diag-open", if open { "1" } else { "0" });
+    }
+
+    let _ = state
+        .tools_button
+        .set_attribute("aria-expanded", if open { "true" } else { "false" });
+    let _ = state
+        .tools_button
+        .set_attribute("aria-pressed", if open { "true" } else { "false" });
+    let _ = state.tools_button.set_attribute(
+        "title",
+        if open {
+            "Hide diagnostics"
+        } else {
+            "Diagnostics"
+        },
+    );
+    let _ = state
+        .diagnostics
+        .set_attribute("aria-hidden", if open { "false" } else { "true" });
 }
 
 fn compile_shader(gl: &Gl, shader_type: u32, source: &str) -> Result<WebGlShader, JsValue> {
@@ -391,6 +419,7 @@ fn update_diagnostics(state: &AppState) -> Result<(), JsValue> {
         format!("event: {}", state.last_event),
         format!("image_loaded: {}", state.image_loaded),
         format!("context_lost: {}", state.context_lost),
+        format!("diagnostics_open: {}", state.diagnostics_open),
         format!(
             "canvas: {}x{} (dpr {:.2})",
             state.canvas.width(),
@@ -457,6 +486,11 @@ fn start_impl() -> Result<(), JsValue> {
         .ok_or_else(|| JsValue::from_str("Missing canvas"))?
         .dyn_into::<HtmlCanvasElement>()?;
 
+    let tools_button = document
+        .get_element_by_id("tools-button")
+        .ok_or_else(|| JsValue::from_str("Missing tools button"))?
+        .dyn_into::<HtmlButtonElement>()?;
+
     let diagnostics = document
         .get_element_by_id("diagnostics")
         .ok_or_else(|| JsValue::from_str("Missing diagnostics"))?
@@ -490,6 +524,7 @@ fn start_impl() -> Result<(), JsValue> {
         .unwrap_or(0.0) as i32;
 
     let user_agent = win.navigator().user_agent().unwrap_or_default();
+    let is_headless = user_agent.to_ascii_lowercase().contains("headless");
 
     let program = create_program(&gl, VERTEX_SHADER_SOURCE, FRAGMENT_SHADER_SOURCE)?;
     let position_buffer = gl
@@ -540,6 +575,8 @@ fn start_impl() -> Result<(), JsValue> {
         u_texture,
         canvas,
         diagnostics,
+        tools_button,
+        diagnostics_open: false,
         fallback,
         image: image.clone(),
         image_loaded: false,
@@ -556,6 +593,11 @@ fn start_impl() -> Result<(), JsValue> {
         last_event: "init".to_string(),
     }));
 
+    {
+        let mut state = state.borrow_mut();
+        set_diagnostics_open(&document, &mut state, is_headless);
+    }
+
     set_status(
         &document,
         &state.borrow().diagnostics,
@@ -563,6 +605,22 @@ fn start_impl() -> Result<(), JsValue> {
         "Loading title screen…",
     );
     let _ = update_diagnostics(&state.borrow());
+
+    let state_toggle = Rc::clone(&state);
+    let toggle = Closure::wrap(Box::new(move |_event: Event| {
+        let document = window().document().expect("missing document");
+        let mut state = state_toggle.borrow_mut();
+        state.last_event = "toggle_diagnostics".to_string();
+        let open = !state.diagnostics_open;
+        set_diagnostics_open(&document, &mut state, open);
+        let _ = update_diagnostics(&state);
+    }) as Box<dyn FnMut(_)>);
+
+    state
+        .borrow()
+        .tools_button
+        .add_event_listener_with_callback("click", toggle.as_ref().unchecked_ref())?;
+    toggle.forget();
 
     let raf_holder: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
     let schedule_redraw: Rc<dyn Fn()> = {
