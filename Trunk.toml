@@ -1,0 +1,8 @@
+[build]
+dist = "dist"
+public_url = "/"
+filehash = false
+no_sri = true
+
+[serve]
+no_autoreload = true

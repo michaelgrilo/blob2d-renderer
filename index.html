@@ -4,11 +4,18 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Beyond vs Below</title>
+    <link rel="icon" href="/assets/title_screen/title_screen.png" type="image/png" />
     <link data-trunk rel="rust" />
     <link data-trunk rel="copy-dir" href="assets" />
+    <link data-trunk rel="copy-file" href="sw_bootstrap_sync.js" />
+    <link data-trunk rel="copy-file" href="sw_bootstrap.js" />
     <style>
       :root {
         color-scheme: dark;
+        --frame-x: 0px;
+        --frame-y: 0px;
+        --frame-w: 100vw;
+        --frame-h: 100vh;
       }
 
       * {
@@ -34,12 +41,24 @@
         touch-action: none;
       }
 
-      #diagnostics {
+      #hud {
         position: fixed;
+        left: var(--frame-x);
+        top: var(--frame-y);
+        width: var(--frame-w);
+        height: var(--frame-h);
+        pointer-events: none;
+        z-index: 40;
+        transform: translateZ(0);
+        backface-visibility: hidden;
+      }
+
+      #diagnostics {
+        position: absolute;
         top: 64px;
         right: 12px;
-        max-width: min(92vw, 520px);
-        max-height: min(62vh, 460px);
+        max-width: min(calc(var(--frame-w) - 24px), 520px);
+        max-height: min(calc(var(--frame-h) - 88px), 460px);
         overflow: auto;
         background: rgba(5, 10, 16, 0.78);
         color: #c6ecff;
@@ -54,6 +73,7 @@
         transform-origin: top right;
         transition: opacity 160ms ease, transform 160ms ease;
         z-index: 40;
+        pointer-events: auto;
       }
 
       html[data-diag-open="0"] #diagnostics {
@@ -65,11 +85,10 @@
       html[data-diag-open="1"] #diagnostics {
         opacity: 1;
         transform: translateY(0) scale(1);
-        pointer-events: auto;
       }
 
       #tools-button {
-        position: fixed;
+        position: absolute;
         top: 12px;
         right: 12px;
         width: 44px;
@@ -83,14 +102,20 @@
         cursor: pointer;
         z-index: 50;
         -webkit-tap-highlight-color: transparent;
+        pointer-events: auto;
+        transform: translateZ(0);
+        backface-visibility: hidden;
+        will-change: transform, opacity;
       }
 
-      #tools-button:hover {
-        background: rgba(10, 18, 28, 0.74);
+      @media (hover: hover) and (pointer: fine) {
+        #tools-button:hover {
+          background: rgba(10, 18, 28, 0.74);
+        }
       }
 
       #tools-button:active {
-        transform: translateY(1px);
+        opacity: 0.94;
       }
 
       #tools-button[aria-expanded="true"] {
@@ -121,34 +146,36 @@
   </head>
   <body>
     <canvas id="gl-canvas" aria-label="Beyond vs Below title screen"></canvas>
-    <button
-      id="tools-button"
-      type="button"
-      aria-label="Toggle diagnostics"
-      aria-controls="diagnostics"
-      aria-expanded="false"
-      title="Diagnostics"
-    >
-      <!-- Oscilloscope icon (diagnostics/instrumentation) -->
-      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-        <path
-          d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v13A2.5 2.5 0 0 1 17.5 21h-11A2.5 2.5 0 0 1 4 18.5v-13Z"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.7"
-          stroke-linejoin="round"
-        />
-        <path
-          d="M6.5 14h2.2l1.1-4.1 2.2 8.2 1.4-5.1h3.1"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.7"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        />
-      </svg>
-    </button>
-    <div id="diagnostics" role="status" aria-live="polite">Initializing…</div>
+    <div id="hud">
+      <button
+        id="tools-button"
+        type="button"
+        aria-label="Toggle diagnostics"
+        aria-controls="diagnostics"
+        aria-expanded="false"
+        title="Diagnostics"
+      >
+        <!-- Oscilloscope icon (diagnostics/instrumentation) -->
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path
+            d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v13A2.5 2.5 0 0 1 17.5 21h-11A2.5 2.5 0 0 1 4 18.5v-13Z"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.7"
+            stroke-linejoin="round"
+          />
+          <path
+            d="M6.5 14h2.2l1.1-4.1 2.2 8.2 1.4-5.1h3.1"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.7"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
+      </button>
+      <div id="diagnostics" role="status" aria-live="polite">Initializing…</div>
+    </div>
     <div id="fallback" hidden>
       <div>
         <h1>Beyond vs Below</h1>

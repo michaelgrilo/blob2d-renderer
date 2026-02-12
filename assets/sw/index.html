@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Beyond vs Below Service Worker</title>
+    
+<script type="module">
+import init, * as bindings from '/assets/sw/bvb_sw.js';
+const wasm = await init({ module_or_path: '/assets/sw/bvb_sw_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+  <link rel="modulepreload" href="/assets/sw/bvb_sw.js" crossorigin="anonymous" integrity="sha384-dSb54DTVbZa5j2duY8N7VxKgx2fVLZhDxS2c3QuGNIMO/HewlgwIi7rWUQSNbNbk"><link rel="preload" href="/assets/sw/bvb_sw_bg.wasm" crossorigin="anonymous" integrity="sha384-j5lkhpDJFMc3C+SIKRxo4SGzM2ooSKnBmAOGMc/sy02i0d3QBQyYKA5pauf2FbB4" as="fetch" type="application/wasm"></head>
+  <body></body>
+</html>

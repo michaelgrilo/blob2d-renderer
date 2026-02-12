@@ -1,0 +1,5 @@
+[build]
+target = "sw.html"
+dist = "../assets/sw"
+public_url = "/assets/sw/"
+filehash = false

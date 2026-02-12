@@ -1,12 +1,13 @@
-use js_sys::{Object, Reflect};
+use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array, WebAssembly};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    Document, Event, HtmlButtonElement, HtmlCanvasElement, HtmlDivElement, HtmlImageElement,
-    WebGlBuffer, WebGlProgram, WebGlRenderingContext as Gl, WebGlShader, WebGlTexture,
-    WebGlUniformLocation, Window,
+    Document, Event, HtmlButtonElement, HtmlCanvasElement, HtmlDivElement, HtmlElement,
+    HtmlImageElement, Response, WebGlBuffer, WebGlProgram, WebGlRenderingContext as Gl,
+    WebGlShader, WebGlTexture, WebGlUniformLocation, Window,
 };
 
 const VERTEX_SHADER_SOURCE: &str = r#"
@@ -28,6 +29,9 @@ void main() {
 }
 "#;
 
+const LEVEL_WASM_URL: &str = "assets/levels/mall_parking_lot.wasm";
+const SW_BOOTSTRAP_URL: &str = "/sw_bootstrap_sync.js?v=sync-init-5";
+
 #[derive(Clone, Copy)]
 struct DrawInfo {
     frame_width: f64,
@@ -39,6 +43,26 @@ struct DrawInfo {
     draw_height: f64,
     x: f64,
     y: f64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scene {
+    Title,
+    LoadingLevel,
+    Level,
+}
+
+struct LevelMap {
+    width: u32,
+    height: u32,
+    pixels_rgba: Vec<u8>,
+}
+
+enum LevelLoadState {
+    NotStarted,
+    Loading,
+    Ready(LevelMap),
+    Error(String),
 }
 
 struct AppState {
@@ -56,9 +80,14 @@ struct AppState {
     diagnostics_open: bool,
     fallback: Option<HtmlDivElement>,
     image: HtmlImageElement,
-    image_loaded: bool,
+    title_loaded: bool,
+    scene: Scene,
+    content_width: u32,
+    content_height: u32,
+    level_state: LevelLoadState,
     context_lost: bool,
     draw_info: Option<DrawInfo>,
+    hud_frame_css: Option<(i32, i32, i32, i32)>,
     document: Document,
     user_agent: String,
     gl_version: String,
@@ -72,6 +101,147 @@ struct AppState {
 
 fn window() -> Window {
     web_sys::window().expect("missing window")
+}
+
+fn should_register_service_worker() -> Result<(), String> {
+    let location = window().location();
+    let search = location.search().unwrap_or_default();
+    if search.contains("nosw=1") {
+        return Err("disabled via nosw=1".to_string());
+    }
+
+    Ok(())
+}
+
+fn service_worker_container() -> Result<JsValue, String> {
+    let navigator = window().navigator();
+    let nav_js: JsValue = navigator.into();
+
+    let has_sw = Reflect::has(&nav_js, &JsValue::from_str("serviceWorker"))
+        .map_err(|err| js_value_to_string(&err))?;
+    if !has_sw {
+        return Err("service worker unsupported".to_string());
+    }
+
+    let sw_container = Reflect::get(&nav_js, &JsValue::from_str("serviceWorker"))
+        .map_err(|err| js_value_to_string(&err))?;
+    if sw_container.is_undefined() || sw_container.is_null() {
+        return Err("service worker unavailable".to_string());
+    }
+
+    Ok(sw_container)
+}
+
+fn js_function(target: &JsValue, name: &str) -> Result<Function, String> {
+    Reflect::get(target, &JsValue::from_str(name))
+        .map_err(|err| js_value_to_string(&err))?
+        .dyn_into::<Function>()
+        .map_err(|_| format!("{} missing", name))
+}
+
+fn registration_script_url(registration: &JsValue) -> Option<String> {
+    for key in ["active", "waiting", "installing"] {
+        let Ok(worker) = Reflect::get(registration, &JsValue::from_str(key)) else {
+            continue;
+        };
+        if worker.is_null() || worker.is_undefined() {
+            continue;
+        }
+        let Ok(url) = Reflect::get(&worker, &JsValue::from_str("scriptURL")) else {
+            continue;
+        };
+        if let Some(url) = url.as_string() {
+            return Some(url);
+        }
+    }
+
+    None
+}
+
+async fn unregister_registration(registration: &JsValue) -> Result<(), String> {
+    let unregister = js_function(registration, "unregister")?;
+    let promise = unregister
+        .call0(registration)
+        .map_err(|err| js_value_to_string(&err))?;
+    let _ = JsFuture::from(Promise::from(promise))
+        .await
+        .map_err(|err| js_value_to_string(&err))?;
+    Ok(())
+}
+
+async fn prune_stale_service_worker_registrations(sw_container: &JsValue) -> Result<u32, String> {
+    let get_registrations = js_function(sw_container, "getRegistrations")?;
+    let registrations_value = get_registrations
+        .call0(sw_container)
+        .map_err(|err| js_value_to_string(&err))?;
+    let registrations_value = JsFuture::from(Promise::from(registrations_value))
+        .await
+        .map_err(|err| js_value_to_string(&err))?;
+    let registrations = Array::from(&registrations_value);
+    let mut removed = 0;
+
+    for registration in registrations.iter() {
+        let Some(url) = registration_script_url(&registration) else {
+            continue;
+        };
+        if url.contains(SW_BOOTSTRAP_URL) {
+            continue;
+        }
+        unregister_registration(&registration).await?;
+        removed += 1;
+    }
+
+    Ok(removed)
+}
+
+async fn register_service_worker_async() -> Result<String, String> {
+    should_register_service_worker()?;
+
+    let sw_container = service_worker_container()?;
+    let removed = prune_stale_service_worker_registrations(&sw_container).await?;
+    let register = js_function(&sw_container, "register")
+        .map_err(|_| "serviceWorker.register missing".to_string())?;
+
+    let options = Object::new();
+    Reflect::set(
+        &options,
+        &JsValue::from_str("type"),
+        &JsValue::from_str("module"),
+    )
+    .map_err(|err| js_value_to_string(&err))?;
+
+    let registration = register
+        .call2(
+            &sw_container,
+            &JsValue::from_str(SW_BOOTSTRAP_URL),
+            &JsValue::from(options),
+        )
+        .map_err(|err| js_value_to_string(&err))?;
+    let registration = JsFuture::from(Promise::from(registration))
+        .await
+        .map_err(|err| js_value_to_string(&err))?;
+    let script_url = registration_script_url(&registration).unwrap_or_else(|| "(pending)".into());
+
+    Ok(format!(
+        "sw_register (removed_stale={}, script={})",
+        removed, script_url
+    ))
+}
+
+fn compute_frame(canvas_width: f64, canvas_height: f64) -> (f64, f64, f64, f64) {
+    let target_aspect = 9.0 / 16.0;
+    let canvas_aspect = canvas_width / canvas_height;
+
+    let (frame_width, frame_height) = if canvas_aspect > target_aspect {
+        (canvas_height * target_aspect, canvas_height)
+    } else {
+        (canvas_width, canvas_width / target_aspect)
+    };
+
+    let frame_x = (canvas_width - frame_width) * 0.5;
+    let frame_y = (canvas_height - frame_height) * 0.5;
+
+    (frame_width, frame_height, frame_x, frame_y)
 }
 
 fn js_value_to_string(value: &JsValue) -> String {
@@ -105,6 +275,53 @@ fn gl_check(gl: &Gl, label: &str) -> Option<String> {
     }
 }
 
+fn sw_control_status() -> (bool, bool, Option<String>) {
+    let navigator = window().navigator();
+    let nav_js: JsValue = navigator.into();
+    let has_sw = Reflect::has(&nav_js, &JsValue::from_str("serviceWorker")).unwrap_or(false);
+    if !has_sw {
+        return (false, false, None);
+    }
+
+    let Ok(sw_container) = Reflect::get(&nav_js, &JsValue::from_str("serviceWorker")) else {
+        return (true, false, None);
+    };
+    if sw_container.is_undefined() || sw_container.is_null() {
+        return (true, false, None);
+    }
+
+    let controller = Reflect::get(&sw_container, &JsValue::from_str("controller"))
+        .ok()
+        .filter(|v| !v.is_null() && !v.is_undefined());
+
+    let controller_url = controller.as_ref().and_then(|controller| {
+        Reflect::get(controller, &JsValue::from_str("scriptURL"))
+            .ok()
+            .and_then(|v| v.as_string())
+    });
+
+    (true, controller.is_some(), controller_url)
+}
+
+fn scene_name(scene: Scene) -> &'static str {
+    match scene {
+        Scene::Title => "title",
+        Scene::LoadingLevel => "loading_level",
+        Scene::Level => "level",
+    }
+}
+
+fn level_state_summary(state: &LevelLoadState) -> String {
+    match state {
+        LevelLoadState::NotStarted => "not_started".to_string(),
+        LevelLoadState::Loading => "loading".to_string(),
+        LevelLoadState::Ready(level) => {
+            format!("ready ({}x{})", level.width, level.height)
+        }
+        LevelLoadState::Error(message) => format!("error ({})", message),
+    }
+}
+
 fn create_webgl_context(canvas: &HtmlCanvasElement) -> Result<Gl, JsValue> {
     // Conservative defaults to reduce GPU work and avoid expensive buffers.
     let options = Object::new();
@@ -133,11 +350,220 @@ fn create_webgl_context(canvas: &HtmlCanvasElement) -> Result<Gl, JsValue> {
         .map_err(|_| JsValue::from_str("WebGL context is not a WebGlRenderingContext"))
 }
 
+fn get_export_fn(exports: &JsValue, name: &str) -> Result<Function, JsValue> {
+    Reflect::get(exports, &JsValue::from_str(name))?
+        .dyn_into::<Function>()
+        .map_err(|_| JsValue::from_str(&format!("Missing export function: {}", name)))
+}
+
+fn call_export_u32(func: &Function, name: &str) -> Result<u32, JsValue> {
+    let value = func.call0(&JsValue::UNDEFINED)?;
+    value
+        .as_f64()
+        .map(|v| v.max(0.0) as u32)
+        .ok_or_else(|| JsValue::from_str(&format!("Export did not return a number: {}", name)))
+}
+
+async fn load_level_map_from_wasm(url: &str) -> Result<LevelMap, JsValue> {
+    let resp_value = JsFuture::from(window().fetch_with_str(url)).await?;
+    let resp: Response = resp_value.dyn_into()?;
+    if !resp.ok() {
+        return Err(JsValue::from_str(&format!(
+            "Failed to fetch {} (HTTP {})",
+            url,
+            resp.status()
+        )));
+    }
+
+    let buf_value = JsFuture::from(resp.array_buffer()?).await?;
+    let buffer: ArrayBuffer = buf_value.dyn_into()?;
+
+    // `js_sys::WebAssembly::instantiate_buffer` takes a Rust byte slice. Copy once from the
+    // fetched ArrayBuffer into wasm memory so we can pass `&[u8]`.
+    let buf_u8 = Uint8Array::new(&buffer);
+    let mut wasm_bytes = vec![0u8; buf_u8.length() as usize];
+    buf_u8.copy_to(&mut wasm_bytes);
+
+    let result =
+        JsFuture::from(WebAssembly::instantiate_buffer(&wasm_bytes, &Object::new())).await?;
+    let instance = Reflect::get(&result, &JsValue::from_str("instance"))?;
+    let exports = Reflect::get(&instance, &JsValue::from_str("exports"))?;
+
+    // Initialize/generate pixels inside the level module.
+    let init = get_export_fn(&exports, "bvb_level_init")?;
+    init.call0(&JsValue::UNDEFINED)?;
+
+    let width_fn = get_export_fn(&exports, "bvb_level_width")?;
+    let height_fn = get_export_fn(&exports, "bvb_level_height")?;
+    let ptr_fn = get_export_fn(&exports, "bvb_level_pixels_ptr")?;
+    let len_fn = get_export_fn(&exports, "bvb_level_pixels_len")?;
+
+    let width = call_export_u32(&width_fn, "bvb_level_width")?;
+    let height = call_export_u32(&height_fn, "bvb_level_height")?;
+    let ptr = call_export_u32(&ptr_fn, "bvb_level_pixels_ptr")?;
+    let len = call_export_u32(&len_fn, "bvb_level_pixels_len")?;
+
+    let expected_len = width.saturating_mul(height).saturating_mul(4).max(1);
+    if len != expected_len {
+        return Err(JsValue::from_str(&format!(
+            "Level pixel buffer has unexpected length: got {}, expected {}",
+            len, expected_len
+        )));
+    }
+
+    let memory = Reflect::get(&exports, &JsValue::from_str("memory"))?;
+    let mem_buffer = Reflect::get(&memory, &JsValue::from_str("buffer"))?;
+    let mem_u8 = Uint8Array::new(&mem_buffer);
+
+    let start = ptr;
+    let end = ptr.saturating_add(len);
+    let slice = mem_u8.subarray(start, end);
+    let mut pixels = vec![0u8; len as usize];
+    slice.copy_to(&mut pixels);
+
+    Ok(LevelMap {
+        width,
+        height,
+        pixels_rgba: pixels,
+    })
+}
+
+fn upload_level_map_texture(
+    gl: &Gl,
+    texture: &WebGlTexture,
+    level: &LevelMap,
+) -> Result<Option<String>, JsValue> {
+    gl.bind_texture(Gl::TEXTURE_2D, Some(texture));
+    gl.pixel_storei(Gl::UNPACK_ALIGNMENT, 1);
+    gl.pixel_storei(Gl::UNPACK_FLIP_Y_WEBGL, 0);
+
+    gl.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
+        Gl::TEXTURE_2D,
+        0,
+        Gl::RGBA as i32,
+        level.width as i32,
+        level.height as i32,
+        0,
+        Gl::RGBA,
+        Gl::UNSIGNED_BYTE,
+        Some(&level.pixels_rgba),
+    )?;
+
+    Ok(gl_check(gl, "texImage2D(level)"))
+}
+
+fn ensure_level_prefetch(state: Rc<RefCell<AppState>>, schedule_redraw: Rc<dyn Fn()>) {
+    {
+        let mut st = state.borrow_mut();
+        match st.level_state {
+            LevelLoadState::NotStarted => {
+                st.level_state = LevelLoadState::Loading;
+                st.last_event = "level_prefetch_start".to_string();
+                let _ = update_diagnostics(&st);
+            }
+            LevelLoadState::Loading | LevelLoadState::Ready(_) => {
+                return;
+            }
+            LevelLoadState::Error(_) => {
+                // Allow retry.
+                st.level_state = LevelLoadState::Loading;
+                st.last_event = "level_prefetch_retry".to_string();
+                let _ = update_diagnostics(&st);
+            }
+        }
+    }
+
+    spawn_local(async move {
+        let result = load_level_map_from_wasm(LEVEL_WASM_URL).await;
+
+        let should_start_game = {
+            let mut st = state.borrow_mut();
+            match result {
+                Ok(level) => {
+                    st.level_state = LevelLoadState::Ready(level);
+                    st.last_event = "level_prefetch_ready".to_string();
+                }
+                Err(err) => {
+                    st.level_state = LevelLoadState::Error(js_value_to_string(&err));
+                    st.last_event = "level_prefetch_error".to_string();
+                }
+            }
+            let _ = update_diagnostics(&st);
+            st.scene == Scene::LoadingLevel
+        };
+
+        if should_start_game {
+            let mut st = state.borrow_mut();
+            let mut maybe_upload: Option<(u32, u32, Result<Option<String>, JsValue>)> = None;
+            let mut maybe_error: Option<String> = None;
+            match &st.level_state {
+                LevelLoadState::Ready(level) => {
+                    maybe_upload = Some((
+                        level.width.max(1),
+                        level.height.max(1),
+                        upload_level_map_texture(&st.gl, &st.texture, level),
+                    ));
+                }
+                LevelLoadState::Error(message) => {
+                    maybe_error = Some(message.clone());
+                }
+                _ => {}
+            }
+
+            if let Some((width, height, upload)) = maybe_upload {
+                match upload {
+                    Ok(gl_err) => {
+                        st.scene = Scene::Level;
+                        st.content_width = width;
+                        st.content_height = height;
+                        st.last_event = "level_upload".to_string();
+                        st.last_gl_error = gl_err;
+
+                        let _ = update_geometry(&mut st);
+                        render(&mut st);
+                        set_status(&st.document, &st.diagnostics, "in_game", "In game");
+                        let _ = update_diagnostics(&st);
+                    }
+                    Err(_) => {
+                        set_status(
+                            &st.document,
+                            &st.diagnostics,
+                            "error",
+                            "Failed to upload level texture",
+                        );
+                        let _ = update_diagnostics(&st);
+                    }
+                }
+            } else if let Some(message) = maybe_error {
+                set_status(&st.document, &st.diagnostics, "error", &message);
+                let _ = update_diagnostics(&st);
+            }
+        }
+
+        schedule_redraw();
+    });
+}
+
 fn set_status(document: &Document, diagnostics: &HtmlDivElement, status: &str, message: &str) {
     if let Some(el) = document.document_element() {
         let _ = el.set_attribute("data-render-status", status);
     }
     diagnostics.set_text_content(Some(message));
+}
+
+fn set_frame_css_vars(document: &Document, x: i32, y: i32, w: i32, h: i32) {
+    let Some(el) = document.document_element() else {
+        return;
+    };
+    let Ok(html_el) = el.dyn_into::<HtmlElement>() else {
+        return;
+    };
+
+    let style = html_el.style();
+    let _ = style.set_property("--frame-x", &format!("{}px", x));
+    let _ = style.set_property("--frame-y", &format!("{}px", y));
+    let _ = style.set_property("--frame-w", &format!("{}px", w));
+    let _ = style.set_property("--frame-h", &format!("{}px", h));
 }
 
 fn set_diagnostics_open(document: &Document, state: &mut AppState, open: bool) {
@@ -220,27 +646,22 @@ fn create_program(
 fn compute_draw_info(
     canvas_width: f64,
     canvas_height: f64,
-    image_width: f64,
-    image_height: f64,
+    content_width: f64,
+    content_height: f64,
+    scene: Scene,
 ) -> DrawInfo {
-    let target_aspect = 9.0 / 16.0;
-    let canvas_aspect = canvas_width / canvas_height;
-
-    let (frame_width, frame_height) = if canvas_aspect > target_aspect {
-        (canvas_height * target_aspect, canvas_height)
-    } else {
-        (canvas_width, canvas_width / target_aspect)
+    let (frame_width, frame_height, frame_x, frame_y) = compute_frame(canvas_width, canvas_height);
+    let scale = match scene {
+        // Title should fill the vertical frame edge-to-edge.
+        Scene::Title => (frame_width / content_width).max(frame_height / content_height),
+        // Keep level content fully visible.
+        Scene::LoadingLevel | Scene::Level => {
+            (frame_width / content_width).min(frame_height / content_height)
+        }
     };
 
-    let frame_x = (canvas_width - frame_width) * 0.5;
-    let frame_y = (canvas_height - frame_height) * 0.5;
-
-    let max_width = frame_width * 0.92;
-    let max_height = frame_height * 0.86;
-    let scale = (max_width / image_width).min(max_height / image_height);
-
-    let draw_width = image_width * scale;
-    let draw_height = image_height * scale;
+    let draw_width = content_width * scale;
+    let draw_height = content_height * scale;
 
     let x = frame_x + (frame_width - draw_width) * 0.5;
     let y = frame_y + (frame_height - draw_height) * 0.5;
@@ -259,21 +680,30 @@ fn compute_draw_info(
 }
 
 fn update_geometry(state: &mut AppState) -> Result<(), JsValue> {
-    if state.context_lost || !state.image_loaded {
+    if state.context_lost {
         return Ok(());
     }
 
     let window = window();
     let dpr = window.device_pixel_ratio().min(2.5);
-    let width = window.inner_width()?.as_f64().unwrap_or(1.0).max(1.0) * dpr;
-    let height = window.inner_height()?.as_f64().unwrap_or(1.0).max(1.0) * dpr;
+    let css_width = window.inner_width()?.as_f64().unwrap_or(1.0).max(1.0);
+    let css_height = window.inner_height()?.as_f64().unwrap_or(1.0).max(1.0);
+    let mut width = (css_width * dpr).max(1.0);
+    let mut height = (css_height * dpr).max(1.0);
 
     // Avoid allocating huge canvases on high-DPI or large displays.
     // This is a title screen; we can cap internal resolution without harming UX.
-    let max_rb = state.gl_max_renderbuffer_size.max(1) as u32;
-    let max_dim = max_rb.min(4096);
-    let width = (width.floor() as u32).clamp(1, max_dim);
-    let height = (height.floor() as u32).clamp(1, max_dim);
+    let max_rb = state.gl_max_renderbuffer_size.max(1) as f64;
+    let max_dim = max_rb.min(4096.0);
+    let max_side = width.max(height);
+    if max_side > max_dim {
+        let scale = max_dim / max_side;
+        width *= scale;
+        height *= scale;
+    }
+
+    let width = width.floor().max(1.0) as u32;
+    let height = height.floor().max(1.0) as u32;
 
     if state.canvas.width() != width {
         state.canvas.set_width(width);
@@ -284,10 +714,39 @@ fn update_geometry(state: &mut AppState) -> Result<(), JsValue> {
 
     state.gl.viewport(0, 0, width as i32, height as i32);
 
-    let image_width = state.image.natural_width().max(1) as f64;
-    let image_height = state.image.natural_height().max(1) as f64;
+    let scale_x = (width as f64) / css_width;
+    let scale_y = (height as f64) / css_height;
+    let (frame_w, frame_h, frame_x, frame_y) = compute_frame(width as f64, height as f64);
+    let frame_css = (
+        (frame_x / scale_x).round() as i32,
+        (frame_y / scale_y).round() as i32,
+        (frame_w / scale_x).round() as i32,
+        (frame_h / scale_y).round() as i32,
+    );
+    if state.hud_frame_css != Some(frame_css) {
+        set_frame_css_vars(
+            &state.document,
+            frame_css.0,
+            frame_css.1,
+            frame_css.2,
+            frame_css.3,
+        );
+        state.hud_frame_css = Some(frame_css);
+    }
 
-    let draw_info = compute_draw_info(width as f64, height as f64, image_width, image_height);
+    if state.content_width == 0 || state.content_height == 0 {
+        return Ok(());
+    }
+
+    let content_width = state.content_width.max(1) as f64;
+    let content_height = state.content_height.max(1) as f64;
+    let draw_info = compute_draw_info(
+        width as f64,
+        height as f64,
+        content_width,
+        content_height,
+        state.scene,
+    );
     state.draw_info = Some(draw_info);
 
     let left = (draw_info.x / width as f64) * 2.0 - 1.0;
@@ -333,7 +792,7 @@ fn update_geometry(state: &mut AppState) -> Result<(), JsValue> {
 }
 
 fn render(state: &mut AppState) {
-    if state.context_lost || !state.image_loaded {
+    if state.context_lost || state.content_width == 0 || state.content_height == 0 {
         return;
     }
 
@@ -369,8 +828,6 @@ fn render(state: &mut AppState) {
 fn update_diagnostics(state: &AppState) -> Result<(), JsValue> {
     let window = window();
     let dpr = window.device_pixel_ratio().min(2.5);
-    let image_width = state.image.natural_width();
-    let image_height = state.image.natural_height();
 
     let (draw_line, frame_line) = if let Some(draw_info) = state.draw_info {
         (
@@ -413,11 +870,15 @@ fn update_diagnostics(state: &AppState) -> Result<(), JsValue> {
     };
 
     let last_gl_error = state.last_gl_error.as_deref().unwrap_or("none").to_string();
+    let (sw_supported, sw_controlled, sw_script_url) = sw_control_status();
 
     let lines = [
         format!("status: {}", status),
         format!("event: {}", state.last_event),
-        format!("image_loaded: {}", state.image_loaded),
+        format!("scene: {}", scene_name(state.scene)),
+        format!("title_loaded: {}", state.title_loaded),
+        format!("level: {}", level_state_summary(&state.level_state)),
+        format!("content: {}x{}", state.content_width, state.content_height),
         format!("context_lost: {}", state.context_lost),
         format!("diagnostics_open: {}", state.diagnostics_open),
         format!(
@@ -431,11 +892,16 @@ fn update_diagnostics(state: &AppState) -> Result<(), JsValue> {
             window.inner_width()?.as_f64().unwrap_or(0.0).floor(),
             window.inner_height()?.as_f64().unwrap_or(0.0).floor()
         ),
-        format!("image: {}x{}", image_width, image_height),
         draw_line,
         frame_line,
         "target aspect: 9:16".to_string(),
         "context opts: low-power, no-AA, no-depth".to_string(),
+        format!("sw_supported: {}", sw_supported),
+        format!("sw_controlled: {}", sw_controlled),
+        format!(
+            "sw_script: {}",
+            sw_script_url.unwrap_or_else(|| "(none)".to_string())
+        ),
         format!(
             "limits: max_tex {} max_rb {}",
             state.gl_max_texture_size, state.gl_max_renderbuffer_size
@@ -559,8 +1025,8 @@ fn start_impl() -> Result<(), JsValue> {
     gl.bind_texture(Gl::TEXTURE_2D, Some(&texture));
     gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_S, Gl::CLAMP_TO_EDGE as i32);
     gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_WRAP_T, Gl::CLAMP_TO_EDGE as i32);
-    gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::LINEAR as i32);
-    gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::LINEAR as i32);
+    gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MIN_FILTER, Gl::NEAREST as i32);
+    gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::NEAREST as i32);
 
     let image = HtmlImageElement::new()?;
 
@@ -579,9 +1045,14 @@ fn start_impl() -> Result<(), JsValue> {
         diagnostics_open: false,
         fallback,
         image: image.clone(),
-        image_loaded: false,
+        title_loaded: false,
+        scene: Scene::Title,
+        content_width: 0,
+        content_height: 0,
+        level_state: LevelLoadState::NotStarted,
         context_lost: false,
         draw_info: None,
+        hud_frame_css: None,
         document: document.clone(),
         user_agent,
         gl_version,
@@ -596,6 +1067,8 @@ fn start_impl() -> Result<(), JsValue> {
     {
         let mut state = state.borrow_mut();
         set_diagnostics_open(&document, &mut state, is_headless);
+        state.last_event = "sw_register_pending".to_string();
+        let _ = update_geometry(&mut state);
     }
 
     set_status(
@@ -637,7 +1110,7 @@ fn start_impl() -> Result<(), JsValue> {
                 raf_holder_cb.borrow_mut().take();
 
                 let mut state = state_cb.borrow_mut();
-                if state.context_lost || !state.image_loaded {
+                if state.context_lost {
                     return;
                 }
 
@@ -655,6 +1128,116 @@ fn start_impl() -> Result<(), JsValue> {
             }
         })
     };
+
+    {
+        let state_sw = Rc::clone(&state);
+        let schedule_redraw_sw = Rc::clone(&schedule_redraw);
+        spawn_local(async move {
+            let event = match register_service_worker_async().await {
+                Ok(details) => details,
+                Err(reason) => format!("sw_register_skip ({})", reason),
+            };
+
+            let mut state = state_sw.borrow_mut();
+            state.last_event = event;
+            let _ = update_diagnostics(&state);
+            drop(state);
+            schedule_redraw_sw();
+        });
+    }
+
+    let state_pointer = Rc::clone(&state);
+    let schedule_redraw_pointer = Rc::clone(&schedule_redraw);
+    let on_pointerdown = Closure::wrap(Box::new(move |event: Event| {
+        event.prevent_default();
+
+        // Canvas input: tap/click anywhere (outside HUD controls) starts the game.
+        // HUD elements are siblings of the canvas so they won't target this handler.
+        let mut st = state_pointer.borrow_mut();
+        if st.context_lost {
+            return;
+        }
+
+        st.last_event = "pointerdown".to_string();
+
+        if !st.title_loaded || st.scene != Scene::Title {
+            let _ = update_diagnostics(&st);
+            return;
+        }
+
+        let maybe_upload = match &st.level_state {
+            LevelLoadState::Ready(level) => Some((
+                level.width.max(1),
+                level.height.max(1),
+                upload_level_map_texture(&st.gl, &st.texture, level),
+            )),
+            LevelLoadState::Loading => {
+                st.scene = Scene::LoadingLevel;
+                st.last_event = "start_loading_level".to_string();
+                set_status(
+                    &st.document,
+                    &st.diagnostics,
+                    "loading_level",
+                    "Loading level…",
+                );
+                let _ = update_diagnostics(&st);
+                drop(st);
+                schedule_redraw_pointer();
+                return;
+            }
+            LevelLoadState::NotStarted | LevelLoadState::Error(_) => {
+                st.scene = Scene::LoadingLevel;
+                st.last_event = "start_prefetch_level".to_string();
+                set_status(
+                    &st.document,
+                    &st.diagnostics,
+                    "loading_level",
+                    "Loading level…",
+                );
+                let _ = update_diagnostics(&st);
+                drop(st);
+                ensure_level_prefetch(
+                    Rc::clone(&state_pointer),
+                    Rc::clone(&schedule_redraw_pointer),
+                );
+                return;
+            }
+        };
+
+        if let Some((width, height, upload)) = maybe_upload {
+            match upload {
+                Ok(gl_err) => {
+                    st.scene = Scene::Level;
+                    st.content_width = width;
+                    st.content_height = height;
+                    st.last_event = "level_upload".to_string();
+                    st.last_gl_error = gl_err;
+
+                    let _ = update_geometry(&mut st);
+                    render(&mut st);
+                    set_status(&st.document, &st.diagnostics, "in_game", "In game");
+                    let _ = update_diagnostics(&st);
+                    drop(st);
+                    schedule_redraw_pointer();
+                }
+                Err(_) => {
+                    set_status(
+                        &st.document,
+                        &st.diagnostics,
+                        "error",
+                        "Failed to upload level texture",
+                    );
+                    let _ = update_diagnostics(&st);
+                }
+            }
+        }
+    }) as Box<dyn FnMut(_)>);
+
+    state
+        .borrow()
+        .canvas
+        .add_event_listener_with_callback("pointerdown", on_pointerdown.as_ref().unchecked_ref())?;
+    on_pointerdown.forget();
 
     let state_ctxlost = Rc::clone(&state);
     let on_ctxlost = Closure::wrap(Box::new(move |event: Event| {
@@ -687,8 +1270,10 @@ fn start_impl() -> Result<(), JsValue> {
     let state_onload = Rc::clone(&state);
     let onload = Closure::wrap(Box::new(move || {
         let mut state = state_onload.borrow_mut();
-        state.image_loaded = true;
+        state.title_loaded = true;
         state.last_event = "image_onload".to_string();
+        state.content_width = state.image.natural_width().max(1);
+        state.content_height = state.image.natural_height().max(1);
 
         state.gl.bind_texture(Gl::TEXTURE_2D, Some(&state.texture));
         state.gl.pixel_storei(Gl::UNPACK_ALIGNMENT, 1);
@@ -708,9 +1293,10 @@ fn start_impl() -> Result<(), JsValue> {
                 state.last_gl_error = gl_check(&state.gl, "texImage2D");
                 let _ = update_geometry(&mut state);
                 render(&mut state);
-                set_status(&state.document, &state.diagnostics, "ready", "Ready");
+                set_status(&state.document, &state.diagnostics, "ready", "Tap to start");
                 let _ = update_diagnostics(&state);
                 drop(state);
+                ensure_level_prefetch(Rc::clone(&state_onload), Rc::clone(&schedule_redraw_onload));
                 schedule_redraw_onload();
             }
             Err(err) => {
@@ -755,11 +1341,40 @@ fn start_impl() -> Result<(), JsValue> {
 
     let state_resize = Rc::clone(&state);
     let schedule_redraw_resize = Rc::clone(&schedule_redraw);
+    let resize_timer_handle: Rc<RefCell<Option<i32>>> = Rc::new(RefCell::new(None));
+
+    let state_resize_settle = Rc::clone(&state_resize);
+    let schedule_redraw_settle = Rc::clone(&schedule_redraw_resize);
+    let resize_settle_cb: Rc<Closure<dyn FnMut()>> = Rc::new(Closure::wrap(Box::new(move || {
+        let mut state = state_resize_settle.borrow_mut();
+        state.last_event = "resize_settled".to_string();
+        drop(state);
+        schedule_redraw_settle();
+    })
+        as Box<dyn FnMut()>));
+
+    let resize_timer_handle_ev = Rc::clone(&resize_timer_handle);
+    let resize_settle_cb_ev = Rc::clone(&resize_settle_cb);
     let resize = Closure::wrap(Box::new(move |_event: Event| {
         let mut state = state_resize.borrow_mut();
-        state.last_event = "resize".to_string();
+        state.last_event = "resize_event".to_string();
         drop(state);
-        schedule_redraw_resize();
+
+        if let Some(id) = resize_timer_handle_ev.borrow_mut().take() {
+            window().clear_timeout_with_handle(id);
+        }
+
+        match window().set_timeout_with_callback_and_timeout_and_arguments_0(
+            resize_settle_cb_ev.as_ref().as_ref().unchecked_ref(),
+            140,
+        ) {
+            Ok(id) => {
+                *resize_timer_handle_ev.borrow_mut() = Some(id);
+            }
+            Err(_) => {
+                schedule_redraw_resize();
+            }
+        }
     }) as Box<dyn FnMut(_)>);
 
     win.add_event_listener_with_callback("resize", resize.as_ref().unchecked_ref())?;

@@ -6,7 +6,7 @@ This document summarizes the game's goals, scope, and design direction.
 
 Beyond vs Below v0.1.0 | Status: Active | Last Updated: 2026-02-06
 
-Quick Links: [README](../readme.md) | [Notes](./notes.md) | [Architecture](./architecture.md) | [Methodology](./methodology.md) | [TODO](./todo.md) | [Contributing](../contributing.md) | [Documentation Standards](../documentation_standards.md)
+Quick Links: [README](../readme.md) | [Development](./development.md) | [Notes](./notes.md) | [Architecture](./architecture.md) | [Methodology](./methodology.md) | [TODO](./todo.md) | [Contributing](../contributing.md) | [Documentation Standards](../documentation_standards.md)
 
 ## High Concept
 

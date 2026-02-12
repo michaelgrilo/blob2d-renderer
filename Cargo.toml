@@ -10,7 +10,9 @@ crate-type = ["cdylib", "rlib"]
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
+wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
+  "CssStyleDeclaration",
   "console",
   "Document",
   "Element",
@@ -19,9 +21,15 @@ web-sys = { version = "0.3", features = [
   "HtmlButtonElement",
   "HtmlCanvasElement",
   "HtmlDivElement",
+  "HtmlElement",
   "HtmlImageElement",
+  "Location",
   "Node",
   "Navigator",
+  "RegistrationOptions",
+  "Response",
+  "ServiceWorkerContainer",
+  "ServiceWorkerRegistration",
   "Window",
   "WebGlBuffer",
   "WebGlProgram",
@@ -29,6 +37,7 @@ web-sys = { version = "0.3", features = [
   "WebGlShader",
   "WebGlTexture",
   "WebGlUniformLocation",
+  "WorkerType",
 ] }
 
 [dev-dependencies]
