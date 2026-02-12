@@ -14,7 +14,7 @@ const PRECACHE_URLS: [&str; 10] = [
     "/beyond_vs_below.js",
     "/beyond_vs_below_bg.wasm",
     "/assets/title_screen/title_screen.png",
-    "/assets/levels/mall_parking_lot.wasm",
+    "/assets/levels/mall_parking_lot.wasm?v=unit11",
     "/sw_bootstrap_sync.js",
     "/sw_bootstrap.js",
     "/assets/sw/bvb_sw.js",

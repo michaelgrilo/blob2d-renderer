@@ -6,6 +6,8 @@ This runbook documents the current local workflow for stable WebGL iteration.
 
 Use one Trunk dev server, managed by `tmux`, on a fixed local port.
 
+Loopback workflow (desktop only):
+
 ```bash
 tmux new-session -d -s bvb-dev \
   'cd /Users/michaelgrilo/beyond-vs-below && env NO_COLOR=false TRUNK_NO_COLOR=true trunk serve --address 127.0.0.1 --port 4173 --no-autoreload'
@@ -28,6 +30,33 @@ Inspect recent server output:
 ```bash
 tmux capture-pane -pt bvb-dev:0 -S -200
 ```
+
+HTTPS LAN workflow (required for phone offline service-worker tests):
+
+```bash
+cd /Users/michaelgrilo/beyond-vs-below
+./scripts/dev_https_start.sh
+```
+
+The script:
+
+- generates `.tls/bvb-dev-root-ca.crt` (one-time root CA)
+- generates `.tls/bvb-lan.crt` for your current LAN IP
+- starts Trunk in `tmux` session `bvb-https` with TLS + `wss`
+
+Stop:
+
+```bash
+./scripts/dev_https_stop.sh
+```
+
+Trust setup for phone (one-time per device):
+
+1. Copy `/Users/michaelgrilo/beyond-vs-below/.tls/bvb-dev-root-ca.crt` to the phone.
+2. Install the certificate profile on the phone.
+3. iOS only: enable full trust for that root CA in:
+   - `Settings -> General -> About -> Certificate Trust Settings`
+4. Re-open `https://<lan-ip>:4173` and confirm there is no TLS warning page.
 
 Environment note:
 
@@ -77,6 +106,8 @@ If multiple Trunk listeners appear, stop extras before testing.
 - Runtime route caching is disabled on localhost to prevent reload/flicker loops during Trunk iteration.
 - Both bootstrap paths are served for compatibility: `sw_bootstrap_sync.js` and `sw_bootstrap.js`.
 - Use `?nosw=1` to run without service worker caching.
+- Phone/LAN offline validation must use `https://<lan-ip>:4173` (secure context).
+- `http://<lan-ip>:4173` is not sufficient for reliable service-worker offline behavior on phone browsers.
 
 ## Offline Incident Notes (2026-02-11)
 
@@ -118,13 +149,15 @@ Changes made:
 
 ## Deterministic Offline Test Flow
 
-1. Start server once with the runbook command.
-2. Open `http://127.0.0.1:4173`.
+1. Start HTTPS LAN server:
+   - `./scripts/dev_https_start.sh`
+2. Open `https://<lan-ip>:4173` on the phone.
 3. In diagnostics, confirm:
    - `sw_controlled: true`
-   - `sw_script` contains `sync-init-5`
+   - `sw_script` contains `sw_bootstrap_sync.js`
 4. In DevTools Application tab, confirm service worker status is `activated and running`.
-5. Stop server.
+5. Stop server:
+   - `./scripts/dev_https_stop.sh`
 6. Reload the same tab.
 7. Expected result:
    - App still renders from cache offline.

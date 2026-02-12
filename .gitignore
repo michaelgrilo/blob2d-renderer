@@ -3,3 +3,5 @@
 /pkg
 /sw/target
 /levels/*/target
+/.tls
+.DS_Store

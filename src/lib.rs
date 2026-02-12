@@ -1,13 +1,15 @@
 use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array, WebAssembly};
+use qrcodegen::{QrCode, QrCodeEcc};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    Document, Event, HtmlButtonElement, HtmlCanvasElement, HtmlDivElement, HtmlElement,
-    HtmlImageElement, Response, WebGlBuffer, WebGlProgram, WebGlRenderingContext as Gl,
-    WebGlShader, WebGlTexture, WebGlUniformLocation, Window,
+    CanvasRenderingContext2d, Document, Event, HtmlButtonElement, HtmlCanvasElement,
+    HtmlDivElement, HtmlElement, HtmlImageElement, PointerEvent, Response, WebGlBuffer,
+    WebGlProgram,
+    WebGlRenderingContext as Gl, WebGlShader, WebGlTexture, WebGlUniformLocation, Window,
 };
 
 const VERTEX_SHADER_SOURCE: &str = r#"
@@ -29,8 +31,20 @@ void main() {
 }
 "#;
 
-const LEVEL_WASM_URL: &str = "assets/levels/mall_parking_lot.wasm";
-const SW_BOOTSTRAP_URL: &str = "/sw_bootstrap_sync.js?v=sync-init-5";
+const LEVEL_WASM_URL: &str = "assets/levels/mall_parking_lot.wasm?v=unit11";
+const SW_BOOTSTRAP_URL: &str = "/sw_bootstrap_sync.js?v=sync-init-13";
+const ALIEN_SPRITE_BMP: &[u8] = include_bytes!("../assets/characters/alien_256.bmp");
+const DEMON_SPRITE_BMP: &[u8] = include_bytes!("../assets/characters/demon_256.bmp");
+const REF_LEVEL_WIDTH: f64 = 288.0;
+const REF_LEVEL_HEIGHT: f64 = 512.0;
+const BASE_CY_FROM_EDGE_REF: f64 = 66.0;
+const BASE_RADIUS_REF: f64 = 30.0;
+const SPAWN_SPRITE_H_REF: f64 = 44.0;
+const SPAWN_SPRITE_SELECT_SCALE: f64 = 1.16;
+const REF_LANE_CENTERS: [f64; 3] = [86.0, 144.0, 202.0];
+const REF_LANE_WIDTH: f64 = 36.0;
+const REF_LANE_TOP: f64 = 108.0;
+const REF_LANE_BOTTOM: f64 = 404.0;
 
 #[derive(Clone, Copy)]
 struct DrawInfo {
@@ -58,6 +72,19 @@ struct LevelMap {
     pixels_rgba: Vec<u8>,
 }
 
+#[derive(Clone)]
+struct Sprite {
+    width: u32,
+    height: u32,
+    pixels_rgba: Vec<u8>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectedSpawn {
+    Alien,
+    Demon,
+}
+
 enum LevelLoadState {
     NotStarted,
     Loading,
@@ -76,6 +103,10 @@ struct AppState {
     u_texture: WebGlUniformLocation,
     canvas: HtmlCanvasElement,
     diagnostics: HtmlDivElement,
+    diagnostics_text: HtmlElement,
+    lan_share: HtmlDivElement,
+    lan_qr: HtmlImageElement,
+    lan_url: HtmlElement,
     tools_button: HtmlButtonElement,
     diagnostics_open: bool,
     fallback: Option<HtmlDivElement>,
@@ -85,6 +116,11 @@ struct AppState {
     content_width: u32,
     content_height: u32,
     level_state: LevelLoadState,
+    selected_spawn: Option<SelectedSpawn>,
+    alien_position: Option<(i32, i32)>,
+    demon_position: Option<(i32, i32)>,
+    alien_sprite: Option<Sprite>,
+    demon_sprite: Option<Sprite>,
     context_lost: bool,
     draw_info: Option<DrawInfo>,
     hud_frame_css: Option<(i32, i32, i32, i32)>,
@@ -322,6 +358,645 @@ fn level_state_summary(state: &LevelLoadState) -> String {
     }
 }
 
+fn selected_spawn_name(selected: Option<SelectedSpawn>) -> &'static str {
+    match selected {
+        Some(SelectedSpawn::Alien) => "alien",
+        Some(SelectedSpawn::Demon) => "demon",
+        None => "none",
+    }
+}
+
+fn position_name(pos: Option<(i32, i32)>) -> String {
+    match pos {
+        Some((x, y)) => format!("{},{}", x, y),
+        None => "(spawn)".to_string(),
+    }
+}
+
+#[inline]
+fn read_le_u16(bytes: &[u8], at: usize) -> Option<u16> {
+    let end = at.checked_add(2)?;
+    let b = bytes.get(at..end)?;
+    Some(u16::from_le_bytes([b[0], b[1]]))
+}
+
+#[inline]
+fn read_le_u32(bytes: &[u8], at: usize) -> Option<u32> {
+    let end = at.checked_add(4)?;
+    let b = bytes.get(at..end)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+#[inline]
+fn read_le_i32(bytes: &[u8], at: usize) -> Option<i32> {
+    let end = at.checked_add(4)?;
+    let b = bytes.get(at..end)?;
+    Some(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+#[inline]
+fn bitfield_shift(mask: u32) -> u32 {
+    mask.trailing_zeros()
+}
+
+#[inline]
+fn bitfield_max(mask: u32) -> u32 {
+    let shifted = mask >> bitfield_shift(mask);
+    shifted.max(1)
+}
+
+#[inline]
+fn extract_channel(v: u32, mask: u32) -> u8 {
+    if mask == 0 {
+        return 255;
+    }
+    let shifted = (v & mask) >> bitfield_shift(mask);
+    ((shifted * 255) / bitfield_max(mask)) as u8
+}
+
+fn decode_bmp_to_rgba(bytes: &[u8]) -> Option<Sprite> {
+    if bytes.get(0..2)? != b"BM" {
+        return None;
+    }
+
+    let data_offset = read_le_u32(bytes, 10)? as usize;
+    let dib_size = read_le_u32(bytes, 14)? as usize;
+    if dib_size < 40 {
+        return None;
+    }
+
+    let width_raw = read_le_i32(bytes, 18)?;
+    let height_raw = read_le_i32(bytes, 22)?;
+    let planes = read_le_u16(bytes, 26)?;
+    let bpp = read_le_u16(bytes, 28)?;
+    let compression = read_le_u32(bytes, 30)?;
+    if planes != 1 {
+        return None;
+    }
+
+    let width = width_raw.unsigned_abs();
+    let height = height_raw.unsigned_abs();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let top_down = height_raw < 0;
+    let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
+
+    match bpp {
+        24 => {
+            if compression != 0 {
+                return None;
+            }
+            let row_stride = (width as usize * 3).div_ceil(4) * 4;
+            let payload_len = row_stride.checked_mul(height as usize)?;
+            let payload = bytes.get(data_offset..data_offset + payload_len)?;
+
+            for y in 0..height as usize {
+                let src_y = if top_down {
+                    y
+                } else {
+                    height as usize - 1 - y
+                };
+                let row = &payload[(src_y * row_stride)..((src_y + 1) * row_stride)];
+                for x in 0..width as usize {
+                    let si = x * 3;
+                    let di = (y * width as usize + x) * 4;
+                    pixels[di] = row[si + 2];
+                    pixels[di + 1] = row[si + 1];
+                    pixels[di + 2] = row[si];
+                    pixels[di + 3] = 255;
+                }
+            }
+        }
+        32 => {
+            let row_stride = width as usize * 4;
+            let payload_len = row_stride.checked_mul(height as usize)?;
+            let payload = bytes.get(data_offset..data_offset + payload_len)?;
+
+            let (rmask, gmask, bmask, amask) = if compression == 3 && dib_size >= 56 {
+                (
+                    read_le_u32(bytes, 54)?,
+                    read_le_u32(bytes, 58)?,
+                    read_le_u32(bytes, 62)?,
+                    read_le_u32(bytes, 66)?,
+                )
+            } else {
+                (0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000)
+            };
+
+            for y in 0..height as usize {
+                let src_y = if top_down {
+                    y
+                } else {
+                    height as usize - 1 - y
+                };
+                let row = &payload[(src_y * row_stride)..((src_y + 1) * row_stride)];
+                for x in 0..width as usize {
+                    let si = x * 4;
+                    let di = (y * width as usize + x) * 4;
+                    let px = u32::from_le_bytes([row[si], row[si + 1], row[si + 2], row[si + 3]]);
+                    pixels[di] = extract_channel(px, rmask);
+                    pixels[di + 1] = extract_channel(px, gmask);
+                    pixels[di + 2] = extract_channel(px, bmask);
+                    pixels[di + 3] = extract_channel(px, amask);
+                }
+            }
+        }
+        _ => return None,
+    }
+
+    Some(Sprite {
+        width,
+        height,
+        pixels_rgba: pixels,
+    })
+}
+
+#[inline]
+fn color_dist_sq(r: u8, g: u8, b: u8, bg: [u8; 3]) -> u32 {
+    let dr = (r as i32) - (bg[0] as i32);
+    let dg = (g as i32) - (bg[1] as i32);
+    let db = (b as i32) - (bg[2] as i32);
+    ((dr * dr) + (dg * dg) + (db * db)) as u32
+}
+
+fn key_background_transparent(sprite: &mut Sprite) {
+    let w = sprite.width as usize;
+    let h = sprite.height as usize;
+    if w == 0 || h == 0 {
+        return;
+    }
+
+    let mut border_samples: Vec<[u8; 3]> = Vec::new();
+    let step_x = (w / 12).max(1);
+    let step_y = (h / 12).max(1);
+
+    for x in (0..w).step_by(step_x) {
+        let top_i = x * 4;
+        let bot_i = ((h - 1) * w + x) * 4;
+        border_samples.push([
+            sprite.pixels_rgba[top_i],
+            sprite.pixels_rgba[top_i + 1],
+            sprite.pixels_rgba[top_i + 2],
+        ]);
+        border_samples.push([
+            sprite.pixels_rgba[bot_i],
+            sprite.pixels_rgba[bot_i + 1],
+            sprite.pixels_rgba[bot_i + 2],
+        ]);
+    }
+    for y in (0..h).step_by(step_y) {
+        let left_i = (y * w) * 4;
+        let right_i = (y * w + (w - 1)) * 4;
+        border_samples.push([
+            sprite.pixels_rgba[left_i],
+            sprite.pixels_rgba[left_i + 1],
+            sprite.pixels_rgba[left_i + 2],
+        ]);
+        border_samples.push([
+            sprite.pixels_rgba[right_i],
+            sprite.pixels_rgba[right_i + 1],
+            sprite.pixels_rgba[right_i + 2],
+        ]);
+    }
+
+    if border_samples.is_empty() {
+        return;
+    }
+
+    let mut sum = [0u32; 3];
+    for s in &border_samples {
+        sum[0] += s[0] as u32;
+        sum[1] += s[1] as u32;
+        sum[2] += s[2] as u32;
+    }
+    let n = border_samples.len() as u32;
+    let bg = [(sum[0] / n) as u8, (sum[1] / n) as u8, (sum[2] / n) as u8];
+
+    let mut spread = 0u32;
+    for s in &border_samples {
+        spread = spread.max(color_dist_sq(s[0], s[1], s[2], bg));
+    }
+    let threshold = (spread + 900).clamp(900, 6400);
+
+    for px in sprite.pixels_rgba.chunks_exact_mut(4) {
+        if px[3] < 8 {
+            continue;
+        }
+        let d2 = color_dist_sq(px[0], px[1], px[2], bg);
+        if d2 <= threshold {
+            px[3] = 0;
+        }
+    }
+}
+
+fn crop_to_alpha(sprite: Sprite) -> Option<Sprite> {
+    let w = sprite.width as usize;
+    let h = sprite.height as usize;
+    let p = &sprite.pixels_rgba;
+    let mut min_x = w;
+    let mut min_y = h;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    let mut found = false;
+
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            if p[i + 3] > 12 {
+                found = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+
+    if !found {
+        return None;
+    }
+
+    let new_w = max_x - min_x + 1;
+    let new_h = max_y - min_y + 1;
+    let mut out = vec![0u8; new_w * new_h * 4];
+    for y in 0..new_h {
+        for x in 0..new_w {
+            let src = ((min_y + y) * w + (min_x + x)) * 4;
+            let dst = (y * new_w + x) * 4;
+            out[dst..dst + 4].copy_from_slice(&p[src..src + 4]);
+        }
+    }
+
+    Some(Sprite {
+        width: new_w as u32,
+        height: new_h as u32,
+        pixels_rgba: out,
+    })
+}
+
+fn resize_nearest(sprite: &Sprite, target_height: u32) -> Sprite {
+    let target_height = target_height.max(1);
+    let target_width = ((sprite.width as u64 * target_height as u64) / sprite.height as u64)
+        .max(1) as u32;
+    let mut out = vec![0u8; target_width as usize * target_height as usize * 4];
+
+    for y in 0..target_height as usize {
+        let src_y = (y * sprite.height as usize) / target_height as usize;
+        for x in 0..target_width as usize {
+            let src_x = (x * sprite.width as usize) / target_width as usize;
+            let src_i = (src_y * sprite.width as usize + src_x) * 4;
+            let dst_i = (y * target_width as usize + x) * 4;
+            out[dst_i..dst_i + 4].copy_from_slice(&sprite.pixels_rgba[src_i..src_i + 4]);
+        }
+    }
+
+    Sprite {
+        width: target_width,
+        height: target_height,
+        pixels_rgba: out,
+    }
+}
+
+fn load_character_sprite(bytes: &[u8]) -> Option<Sprite> {
+    let mut sprite = decode_bmp_to_rgba(bytes)?;
+    key_background_transparent(&mut sprite);
+    crop_to_alpha(sprite)
+}
+
+#[inline]
+fn blend_rgba_over(dst: &mut [u8], src: &[u8]) {
+    let sa = src[3] as u32;
+    if sa == 0 {
+        return;
+    }
+    let inv = 255u32 - sa;
+    dst[0] = (((src[0] as u32 * sa) + (dst[0] as u32 * inv)) / 255) as u8;
+    dst[1] = (((src[1] as u32 * sa) + (dst[1] as u32 * inv)) / 255) as u8;
+    dst[2] = (((src[2] as u32 * sa) + (dst[2] as u32 * inv)) / 255) as u8;
+    dst[3] = 255;
+}
+
+fn blit_sprite_center_bottom_rgba(
+    dest: &mut [u8],
+    dest_width: u32,
+    dest_height: u32,
+    sprite: &Sprite,
+    center_x: i32,
+    bottom_y: i32,
+) {
+    let start_x = center_x - (sprite.width as i32 / 2);
+    let start_y = bottom_y - sprite.height as i32;
+
+    for sy in 0..(sprite.height as i32) {
+        let dy = start_y + sy;
+        if !(0..(dest_height as i32)).contains(&dy) {
+            continue;
+        }
+        for sx in 0..(sprite.width as i32) {
+            let dx = start_x + sx;
+            if !(0..(dest_width as i32)).contains(&dx) {
+                continue;
+            }
+            let src_i = ((sy as usize * sprite.width as usize) + sx as usize) * 4;
+            if sprite.pixels_rgba[src_i + 3] == 0 {
+                continue;
+            }
+            let dst_i = (((dy as u32 * dest_width + dx as u32) * 4) as usize) as usize;
+            blend_rgba_over(
+                &mut dest[dst_i..dst_i + 4],
+                &sprite.pixels_rgba[src_i..src_i + 4],
+            );
+        }
+    }
+}
+
+fn spawn_anchor_for_dims(width: u32, height: u32, spawn: SelectedSpawn) -> (i32, i32, i32) {
+    let sy = height as f64 / REF_LEVEL_HEIGHT;
+    let center_x = (width as f64 * 0.5).round() as i32;
+    let edge_offset = (BASE_CY_FROM_EDGE_REF * sy).round() as i32;
+    let center_y = match spawn {
+        SelectedSpawn::Alien => edge_offset,
+        SelectedSpawn::Demon => height as i32 - edge_offset,
+    };
+    let base_radius = (BASE_RADIUS_REF * sy).round().max(10.0) as i32;
+    (center_x, center_y, base_radius)
+}
+
+fn default_character_position(width: u32, height: u32, spawn: SelectedSpawn) -> (i32, i32) {
+    let sy = height as f64 / REF_LEVEL_HEIGHT;
+    let (cx, cy, base_radius) = spawn_anchor_for_dims(width, height, spawn);
+    let bottom = cy + base_radius - (3.0 * sy).round() as i32;
+    (cx, bottom)
+}
+
+fn character_position_for_spawn(
+    width: u32,
+    height: u32,
+    spawn: SelectedSpawn,
+    stored: Option<(i32, i32)>,
+) -> (i32, i32) {
+    stored.unwrap_or_else(|| default_character_position(width, height, spawn))
+}
+
+fn ensure_character_positions_initialized(state: &mut AppState, width: u32, height: u32) {
+    if state.alien_position.is_none() {
+        state.alien_position = Some(default_character_position(width, height, SelectedSpawn::Alien));
+    }
+    if state.demon_position.is_none() {
+        state.demon_position = Some(default_character_position(width, height, SelectedSpawn::Demon));
+    }
+}
+
+fn character_position(state: &AppState, spawn: SelectedSpawn) -> (i32, i32) {
+    match spawn {
+        SelectedSpawn::Alien => character_position_for_spawn(
+            state.content_width.max(1),
+            state.content_height.max(1),
+            spawn,
+            state.alien_position,
+        ),
+        SelectedSpawn::Demon => character_position_for_spawn(
+            state.content_width.max(1),
+            state.content_height.max(1),
+            spawn,
+            state.demon_position,
+        ),
+    }
+}
+
+fn set_character_position(state: &mut AppState, spawn: SelectedSpawn, pos: (i32, i32)) {
+    match spawn {
+        SelectedSpawn::Alien => state.alien_position = Some(pos),
+        SelectedSpawn::Demon => state.demon_position = Some(pos),
+    }
+}
+
+fn character_sprite_bounds(
+    state: &AppState,
+    spawn: SelectedSpawn,
+    pos: (i32, i32),
+    selected: bool,
+) -> (f64, f64, f64, f64) {
+    let sy = state.content_height as f64 / REF_LEVEL_HEIGHT;
+    let scale = if selected {
+        SPAWN_SPRITE_SELECT_SCALE
+    } else {
+        1.0
+    };
+    let target_h = (SPAWN_SPRITE_H_REF * sy * scale).max(16.0);
+    let sprite = match spawn {
+        SelectedSpawn::Alien => state.alien_sprite.as_ref(),
+        SelectedSpawn::Demon => state.demon_sprite.as_ref(),
+    };
+
+    let aspect = sprite
+        .map(|s| s.width as f64 / s.height.max(1) as f64)
+        .unwrap_or(1.0);
+    let target_w = (target_h * aspect).max(12.0);
+    let left = pos.0 as f64 - (target_w * 0.5);
+    let right = left + target_w;
+    let top = pos.1 as f64 - target_h;
+    let bottom = pos.1 as f64;
+    let pad = (8.0 * sy).max(6.0);
+    (left - pad, top - pad, right + pad, bottom + pad)
+}
+
+#[inline]
+fn point_in_bounds(x: f64, y: f64, bounds: (f64, f64, f64, f64)) -> bool {
+    x >= bounds.0 && x <= bounds.2 && y >= bounds.1 && y <= bounds.3
+}
+
+fn pointer_to_content_coords(state: &AppState, pointer: &PointerEvent) -> Option<(f64, f64)> {
+    let draw = state.draw_info?;
+    let rect = state.canvas.get_bounding_client_rect();
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return None;
+    }
+
+    let css_x = pointer.client_x() as f64 - rect.left();
+    let css_y = pointer.client_y() as f64 - rect.top();
+    if css_x < 0.0 || css_y < 0.0 || css_x > rect.width() || css_y > rect.height() {
+        return None;
+    }
+
+    let px = css_x * state.canvas.width() as f64 / rect.width();
+    let py = css_y * state.canvas.height() as f64 / rect.height();
+
+    if px < draw.x || py < draw.y || px > draw.x + draw.draw_width || py > draw.y + draw.draw_height
+    {
+        return None;
+    }
+
+    let u = (px - draw.x) / draw.draw_width;
+    let v = (py - draw.y) / draw.draw_height;
+    Some((u * state.content_width as f64, v * state.content_height as f64))
+}
+
+fn pick_spawn_at_point(state: &AppState, level_x: f64, level_y: f64) -> Option<SelectedSpawn> {
+    if state.content_width == 0 || state.content_height == 0 {
+        return None;
+    }
+
+    let alien_pos = character_position(state, SelectedSpawn::Alien);
+    let demon_pos = character_position(state, SelectedSpawn::Demon);
+
+    // Primary hit target: sprite footprint, so tapping the character itself is reliable.
+    let alien_bounds = character_sprite_bounds(
+        state,
+        SelectedSpawn::Alien,
+        alien_pos,
+        state.selected_spawn == Some(SelectedSpawn::Alien),
+    );
+    let demon_bounds = character_sprite_bounds(
+        state,
+        SelectedSpawn::Demon,
+        demon_pos,
+        state.selected_spawn == Some(SelectedSpawn::Demon),
+    );
+    let alien_hit = point_in_bounds(level_x, level_y, alien_bounds);
+    let demon_hit = point_in_bounds(level_x, level_y, demon_bounds);
+
+    if alien_hit || demon_hit {
+        if alien_hit && !demon_hit {
+            return Some(SelectedSpawn::Alien);
+        }
+        if demon_hit && !alien_hit {
+            return Some(SelectedSpawn::Demon);
+        }
+        // Overlap edge-case: choose nearest base center.
+    }
+
+    // Fallback hit target: spawn pad circle.
+    let (_, ay, ar) =
+        spawn_anchor_for_dims(state.content_width, state.content_height, SelectedSpawn::Alien);
+    let (_, dy, dr) =
+        spawn_anchor_for_dims(state.content_width, state.content_height, SelectedSpawn::Demon);
+    let hit_radius = (ar.max(dr) as f64 * 1.5).max(34.0);
+    let hit_r2 = hit_radius * hit_radius;
+
+    let alien_d2 = (level_x - alien_pos.0 as f64).powi(2) + (level_y - ay as f64).powi(2);
+    let demon_d2 = (level_x - demon_pos.0 as f64).powi(2) + (level_y - dy as f64).powi(2);
+
+    if alien_d2 <= hit_r2 || demon_d2 <= hit_r2 {
+        if alien_d2 <= demon_d2 {
+            Some(SelectedSpawn::Alien)
+        } else {
+            Some(SelectedSpawn::Demon)
+        }
+    } else {
+        None
+    }
+}
+
+fn lane_target_from_point(state: &AppState, level_x: f64, level_y: f64) -> Option<(usize, i32, i32)> {
+    if state.content_width == 0 || state.content_height == 0 {
+        return None;
+    }
+
+    let sx = state.content_width as f64 / REF_LEVEL_WIDTH;
+    let sy = state.content_height as f64 / REF_LEVEL_HEIGHT;
+    let lane_top = REF_LANE_TOP * sy;
+    let lane_bottom = REF_LANE_BOTTOM * sy;
+    if level_y < lane_top || level_y > lane_bottom {
+        return None;
+    }
+
+    let lane_half = (REF_LANE_WIDTH * sx) * 0.5;
+    let lane_hit_pad = (10.0 * sx).max(8.0);
+    let mut best_idx: Option<usize> = None;
+    let mut best_dist = f64::MAX;
+
+    for (idx, center_ref) in REF_LANE_CENTERS.iter().enumerate() {
+        let center = center_ref * sx;
+        let dist = (level_x - center).abs();
+        if dist <= lane_half + lane_hit_pad && dist < best_dist {
+            best_dist = dist;
+            best_idx = Some(idx);
+        }
+    }
+
+    let lane_idx = best_idx?;
+    let lane_center_x = (REF_LANE_CENTERS[lane_idx] * sx).round() as i32;
+    let y_min = (lane_top + (SPAWN_SPRITE_H_REF * sy * 0.8)).round() as i32;
+    let y_max = (lane_bottom - (2.0 * sy)).round() as i32;
+    let lane_bottom_y = (level_y.round() as i32).clamp(y_min, y_max.max(y_min));
+    Some((lane_idx, lane_center_x, lane_bottom_y))
+}
+
+fn overlay_character_sprite(
+    pixels_rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    sprite: Option<&Sprite>,
+    position: (i32, i32),
+    selected: bool,
+) {
+    let Some(source) = sprite else {
+        return;
+    };
+
+    let sy = height as f64 / REF_LEVEL_HEIGHT;
+    let scale = if selected {
+        SPAWN_SPRITE_SELECT_SCALE
+    } else {
+        1.0
+    };
+    let target_h = ((SPAWN_SPRITE_H_REF * sy * scale).round() as u32).max(16);
+    let scaled = resize_nearest(source, target_h);
+
+    blit_sprite_center_bottom_rgba(
+        pixels_rgba,
+        width,
+        height,
+        &scaled,
+        position.0,
+        position.1,
+    );
+}
+
+fn upload_level_map_texture_with_characters(
+    gl: &Gl,
+    texture: &WebGlTexture,
+    level: &LevelMap,
+    selected: Option<SelectedSpawn>,
+    alien_sprite: Option<&Sprite>,
+    demon_sprite: Option<&Sprite>,
+    alien_position: Option<(i32, i32)>,
+    demon_position: Option<(i32, i32)>,
+) -> Result<Option<String>, JsValue> {
+    let mut composed = level.pixels_rgba.clone();
+    let alien_pos =
+        character_position_for_spawn(level.width, level.height, SelectedSpawn::Alien, alien_position);
+    let demon_pos =
+        character_position_for_spawn(level.width, level.height, SelectedSpawn::Demon, demon_position);
+
+    overlay_character_sprite(
+        &mut composed,
+        level.width,
+        level.height,
+        alien_sprite,
+        alien_pos,
+        selected == Some(SelectedSpawn::Alien),
+    );
+    overlay_character_sprite(
+        &mut composed,
+        level.width,
+        level.height,
+        demon_sprite,
+        demon_pos,
+        selected == Some(SelectedSpawn::Demon),
+    );
+
+    let composed_level = LevelMap {
+        width: level.width,
+        height: level.height,
+        pixels_rgba: composed,
+    };
+
+    upload_level_map_texture(gl, texture, &composed_level)
+}
+
 fn create_webgl_context(canvas: &HtmlCanvasElement) -> Result<Gl, JsValue> {
     // Conservative defaults to reduce GPU work and avoid expensive buffers.
     let options = Object::new();
@@ -501,7 +1176,16 @@ fn ensure_level_prefetch(state: Rc<RefCell<AppState>>, schedule_redraw: Rc<dyn F
                     maybe_upload = Some((
                         level.width.max(1),
                         level.height.max(1),
-                        upload_level_map_texture(&st.gl, &st.texture, level),
+                        upload_level_map_texture_with_characters(
+                            &st.gl,
+                            &st.texture,
+                            level,
+                            st.selected_spawn,
+                            st.alien_sprite.as_ref(),
+                            st.demon_sprite.as_ref(),
+                            st.alien_position,
+                            st.demon_position,
+                        ),
                     ));
                 }
                 LevelLoadState::Error(message) => {
@@ -514,20 +1198,22 @@ fn ensure_level_prefetch(state: Rc<RefCell<AppState>>, schedule_redraw: Rc<dyn F
                 match upload {
                     Ok(gl_err) => {
                         st.scene = Scene::Level;
+                        st.selected_spawn = None;
                         st.content_width = width;
                         st.content_height = height;
+                        ensure_character_positions_initialized(&mut st, width, height);
                         st.last_event = "level_upload".to_string();
                         st.last_gl_error = gl_err;
 
                         let _ = update_geometry(&mut st);
                         render(&mut st);
-                        set_status(&st.document, &st.diagnostics, "in_game", "In game");
+                        set_status(&st.document, &st.diagnostics_text, "in_game", "In game");
                         let _ = update_diagnostics(&st);
                     }
                     Err(_) => {
                         set_status(
                             &st.document,
-                            &st.diagnostics,
+                            &st.diagnostics_text,
                             "error",
                             "Failed to upload level texture",
                         );
@@ -535,7 +1221,7 @@ fn ensure_level_prefetch(state: Rc<RefCell<AppState>>, schedule_redraw: Rc<dyn F
                     }
                 }
             } else if let Some(message) = maybe_error {
-                set_status(&st.document, &st.diagnostics, "error", &message);
+                set_status(&st.document, &st.diagnostics_text, "error", &message);
                 let _ = update_diagnostics(&st);
             }
         }
@@ -544,11 +1230,11 @@ fn ensure_level_prefetch(state: Rc<RefCell<AppState>>, schedule_redraw: Rc<dyn F
     });
 }
 
-fn set_status(document: &Document, diagnostics: &HtmlDivElement, status: &str, message: &str) {
+fn set_status(document: &Document, diagnostics_text: &HtmlElement, status: &str, message: &str) {
     if let Some(el) = document.document_element() {
         let _ = el.set_attribute("data-render-status", status);
     }
-    diagnostics.set_text_content(Some(message));
+    diagnostics_text.set_text_content(Some(message));
 }
 
 fn set_frame_css_vars(document: &Document, x: i32, y: i32, w: i32, h: i32) {
@@ -825,6 +1511,84 @@ fn render(state: &mut AppState) {
     state.last_gl_error = gl_check(&state.gl, "render");
 }
 
+fn render_qr_data_url(document: &Document, payload: &str, size_px: u32) -> Result<String, JsValue> {
+    let qr = QrCode::encode_text(payload, QrCodeEcc::Medium)
+        .map_err(|_| JsValue::from_str("failed to encode LAN QR payload"))?;
+    let qr_size = qr.size();
+    let border_modules = 2i32;
+    let total_modules = qr_size + border_modules * 2;
+
+    let canvas = document
+        .create_element("canvas")?
+        .dyn_into::<HtmlCanvasElement>()?;
+    canvas.set_width(size_px);
+    canvas.set_height(size_px);
+
+    let context = canvas
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("2D canvas unavailable for LAN QR"))?
+        .dyn_into::<CanvasRenderingContext2d>()?;
+    context.set_image_smoothing_enabled(false);
+
+    let size = size_px as f64;
+    context.set_fill_style_str("#f8fcff");
+    context.fill_rect(0.0, 0.0, size, size);
+
+    context.set_fill_style_str("#0a1018");
+    let module_px = size / total_modules as f64;
+
+    for y in 0..qr_size {
+        for x in 0..qr_size {
+            if !qr.get_module(x, y) {
+                continue;
+            }
+
+            let x0 = ((x + border_modules) as f64 * module_px).floor();
+            let y0 = ((y + border_modules) as f64 * module_px).floor();
+            let x1 = ((x + border_modules + 1) as f64 * module_px).ceil();
+            let y1 = ((y + border_modules + 1) as f64 * module_px).ceil();
+            context.fill_rect(x0, y0, (x1 - x0).max(1.0), (y1 - y0).max(1.0));
+        }
+    }
+
+    canvas.to_data_url_with_type("image/png")
+}
+
+fn update_lan_share_qr(state: &AppState) -> Result<(), JsValue> {
+    let location = window().location();
+    let share_url = location.href()?;
+    let host = location.hostname().unwrap_or_default().to_ascii_lowercase();
+    let is_loopback = host == "localhost" || host == "127.0.0.1" || host == "::1";
+
+    let mut label = share_url.clone();
+    if is_loopback {
+        label.push_str(" (loopback host; open via LAN IP to share)");
+    }
+
+    if state
+        .lan_qr
+        .get_attribute("data-qr-payload")
+        .as_deref()
+        != Some(share_url.as_str())
+    {
+        match render_qr_data_url(&state.document, &share_url, 176) {
+            Ok(qr_data_url) => {
+                state.lan_qr.set_src(&qr_data_url);
+                let _ = state.lan_qr.set_attribute("data-qr-payload", &share_url);
+            }
+            Err(err) => {
+                label.push_str("\nQR unavailable: ");
+                label.push_str(&js_value_to_string(&err));
+            }
+        }
+    }
+
+    state.lan_url.set_text_content(Some(&label));
+    let _ = state.lan_share.remove_attribute("hidden");
+
+    Ok(())
+}
+
 fn update_diagnostics(state: &AppState) -> Result<(), JsValue> {
     let window = window();
     let dpr = window.device_pixel_ratio().min(2.5);
@@ -876,6 +1640,9 @@ fn update_diagnostics(state: &AppState) -> Result<(), JsValue> {
         format!("status: {}", status),
         format!("event: {}", state.last_event),
         format!("scene: {}", scene_name(state.scene)),
+        format!("selected: {}", selected_spawn_name(state.selected_spawn)),
+        format!("alien_pos: {}", position_name(state.alien_position)),
+        format!("demon_pos: {}", position_name(state.demon_position)),
         format!("title_loaded: {}", state.title_loaded),
         format!("level: {}", level_state_summary(&state.level_state)),
         format!("content: {}x{}", state.content_width, state.content_height),
@@ -913,7 +1680,8 @@ fn update_diagnostics(state: &AppState) -> Result<(), JsValue> {
         format!("ua: {}", user_agent),
     ];
 
-    state.diagnostics.set_text_content(Some(&lines.join("\n")));
+    state.diagnostics_text.set_text_content(Some(&lines.join("\n")));
+    let _ = update_lan_share_qr(state);
 
     Ok(())
 }
@@ -930,7 +1698,9 @@ pub fn start() {
                 if let Some(el) = doc.document_element() {
                     let _ = el.set_attribute("data-render-status", "error");
                 }
-                if let Some(diag) = doc.get_element_by_id("diagnostics") {
+                if let Some(diag) = doc.get_element_by_id("diagnostics-text") {
+                    diag.set_text_content(Some(&message));
+                } else if let Some(diag) = doc.get_element_by_id("diagnostics") {
                     diag.set_text_content(Some(&message));
                 }
                 if let Some(fallback) = doc.get_element_by_id("fallback") {
@@ -961,6 +1731,22 @@ fn start_impl() -> Result<(), JsValue> {
         .get_element_by_id("diagnostics")
         .ok_or_else(|| JsValue::from_str("Missing diagnostics"))?
         .dyn_into::<HtmlDivElement>()?;
+    let diagnostics_text = document
+        .get_element_by_id("diagnostics-text")
+        .ok_or_else(|| JsValue::from_str("Missing diagnostics text"))?
+        .dyn_into::<HtmlElement>()?;
+    let lan_share = document
+        .get_element_by_id("lan-share")
+        .ok_or_else(|| JsValue::from_str("Missing LAN share panel"))?
+        .dyn_into::<HtmlDivElement>()?;
+    let lan_qr = document
+        .get_element_by_id("lan-qr")
+        .ok_or_else(|| JsValue::from_str("Missing LAN QR image"))?
+        .dyn_into::<HtmlImageElement>()?;
+    let lan_url = document
+        .get_element_by_id("lan-url")
+        .ok_or_else(|| JsValue::from_str("Missing LAN URL label"))?
+        .dyn_into::<HtmlElement>()?;
 
     let fallback = document
         .get_element_by_id("fallback")
@@ -1029,6 +1815,8 @@ fn start_impl() -> Result<(), JsValue> {
     gl.tex_parameteri(Gl::TEXTURE_2D, Gl::TEXTURE_MAG_FILTER, Gl::NEAREST as i32);
 
     let image = HtmlImageElement::new()?;
+    let alien_sprite = load_character_sprite(ALIEN_SPRITE_BMP);
+    let demon_sprite = load_character_sprite(DEMON_SPRITE_BMP);
 
     let state = Rc::new(RefCell::new(AppState {
         gl,
@@ -1041,6 +1829,10 @@ fn start_impl() -> Result<(), JsValue> {
         u_texture,
         canvas,
         diagnostics,
+        diagnostics_text,
+        lan_share,
+        lan_qr,
+        lan_url,
         tools_button,
         diagnostics_open: false,
         fallback,
@@ -1050,6 +1842,11 @@ fn start_impl() -> Result<(), JsValue> {
         content_width: 0,
         content_height: 0,
         level_state: LevelLoadState::NotStarted,
+        selected_spawn: None,
+        alien_position: None,
+        demon_position: None,
+        alien_sprite,
+        demon_sprite,
         context_lost: false,
         draw_info: None,
         hud_frame_css: None,
@@ -1073,7 +1870,7 @@ fn start_impl() -> Result<(), JsValue> {
 
     set_status(
         &document,
-        &state.borrow().diagnostics,
+        &state.borrow().diagnostics_text,
         "loading",
         "Loading title screen…",
     );
@@ -1160,6 +1957,86 @@ fn start_impl() -> Result<(), JsValue> {
 
         st.last_event = "pointerdown".to_string();
 
+        if st.scene == Scene::Level {
+            let Some(pointer) = event.dyn_ref::<PointerEvent>() else {
+                let _ = update_diagnostics(&st);
+                return;
+            };
+
+            let coords = pointer_to_content_coords(&st, pointer);
+            if let Some((level_x, level_y)) = coords {
+                if let Some(picked) = pick_spawn_at_point(&st, level_x, level_y) {
+                    let previous = st.selected_spawn;
+                    st.selected_spawn = Some(picked);
+                    st.last_event = match (previous, Some(picked)) {
+                        (Some(SelectedSpawn::Alien), Some(SelectedSpawn::Demon)) => {
+                            "select_swap_alien_to_demon".to_string()
+                        }
+                        (Some(SelectedSpawn::Demon), Some(SelectedSpawn::Alien)) => {
+                            "select_swap_demon_to_alien".to_string()
+                        }
+                        (_, Some(SelectedSpawn::Alien)) => "select_alien".to_string(),
+                        (_, Some(SelectedSpawn::Demon)) => "select_demon".to_string(),
+                        _ => "select_none".to_string(),
+                    };
+                } else if let Some(selected) = st.selected_spawn {
+                    if let Some((lane_idx, lane_x, lane_bottom_y)) =
+                        lane_target_from_point(&st, level_x, level_y)
+                    {
+                        set_character_position(&mut st, selected, (lane_x, lane_bottom_y));
+                        st.last_event = format!(
+                            "move_{}_lane{}",
+                            selected_spawn_name(Some(selected)),
+                            lane_idx + 1
+                        );
+                    } else {
+                        st.selected_spawn = None;
+                        st.last_event = "select_none".to_string();
+                    }
+                } else {
+                    st.selected_spawn = None;
+                    st.last_event = "select_none".to_string();
+                }
+            } else {
+                st.selected_spawn = None;
+                st.last_event = "select_none".to_string();
+            }
+
+            if let LevelLoadState::Ready(level) = &st.level_state {
+                let upload = upload_level_map_texture_with_characters(
+                    &st.gl,
+                    &st.texture,
+                    level,
+                    st.selected_spawn,
+                    st.alien_sprite.as_ref(),
+                    st.demon_sprite.as_ref(),
+                    st.alien_position,
+                    st.demon_position,
+                );
+                match upload {
+                    Ok(gl_err) => {
+                        st.last_gl_error = gl_err;
+                        render(&mut st);
+                        let _ = update_diagnostics(&st);
+                        drop(st);
+                        schedule_redraw_pointer();
+                    }
+                    Err(_) => {
+                        set_status(
+                            &st.document,
+                            &st.diagnostics_text,
+                            "error",
+                            "Failed to update selected character",
+                        );
+                        let _ = update_diagnostics(&st);
+                    }
+                }
+            } else {
+                let _ = update_diagnostics(&st);
+            }
+            return;
+        }
+
         if !st.title_loaded || st.scene != Scene::Title {
             let _ = update_diagnostics(&st);
             return;
@@ -1169,14 +2046,23 @@ fn start_impl() -> Result<(), JsValue> {
             LevelLoadState::Ready(level) => Some((
                 level.width.max(1),
                 level.height.max(1),
-                upload_level_map_texture(&st.gl, &st.texture, level),
+                upload_level_map_texture_with_characters(
+                    &st.gl,
+                    &st.texture,
+                    level,
+                    st.selected_spawn,
+                    st.alien_sprite.as_ref(),
+                    st.demon_sprite.as_ref(),
+                    st.alien_position,
+                    st.demon_position,
+                ),
             )),
             LevelLoadState::Loading => {
                 st.scene = Scene::LoadingLevel;
                 st.last_event = "start_loading_level".to_string();
                 set_status(
                     &st.document,
-                    &st.diagnostics,
+                    &st.diagnostics_text,
                     "loading_level",
                     "Loading level…",
                 );
@@ -1190,7 +2076,7 @@ fn start_impl() -> Result<(), JsValue> {
                 st.last_event = "start_prefetch_level".to_string();
                 set_status(
                     &st.document,
-                    &st.diagnostics,
+                    &st.diagnostics_text,
                     "loading_level",
                     "Loading level…",
                 );
@@ -1208,14 +2094,16 @@ fn start_impl() -> Result<(), JsValue> {
             match upload {
                 Ok(gl_err) => {
                     st.scene = Scene::Level;
+                    st.selected_spawn = None;
                     st.content_width = width;
                     st.content_height = height;
+                    ensure_character_positions_initialized(&mut st, width, height);
                     st.last_event = "level_upload".to_string();
                     st.last_gl_error = gl_err;
 
                     let _ = update_geometry(&mut st);
                     render(&mut st);
-                    set_status(&st.document, &st.diagnostics, "in_game", "In game");
+                    set_status(&st.document, &st.diagnostics_text, "in_game", "In game");
                     let _ = update_diagnostics(&st);
                     drop(st);
                     schedule_redraw_pointer();
@@ -1223,7 +2111,7 @@ fn start_impl() -> Result<(), JsValue> {
                 Err(_) => {
                     set_status(
                         &st.document,
-                        &st.diagnostics,
+                        &st.diagnostics_text,
                         "error",
                         "Failed to upload level texture",
                     );
@@ -1253,7 +2141,7 @@ fn start_impl() -> Result<(), JsValue> {
 
         set_status(
             &state.document,
-            &state.diagnostics,
+            &state.diagnostics_text,
             "context_lost",
             "WebGL context lost (try reloading)",
         );
@@ -1293,7 +2181,7 @@ fn start_impl() -> Result<(), JsValue> {
                 state.last_gl_error = gl_check(&state.gl, "texImage2D");
                 let _ = update_geometry(&mut state);
                 render(&mut state);
-                set_status(&state.document, &state.diagnostics, "ready", "Tap to start");
+                set_status(&state.document, &state.diagnostics_text, "ready", "Tap to start");
                 let _ = update_diagnostics(&state);
                 drop(state);
                 ensure_level_prefetch(Rc::clone(&state_onload), Rc::clone(&schedule_redraw_onload));
@@ -1306,7 +2194,7 @@ fn start_impl() -> Result<(), JsValue> {
                 }
                 set_status(
                     &state.document,
-                    &state.diagnostics,
+                    &state.diagnostics_text,
                     "error",
                     "Failed to upload texture",
                 );
@@ -1327,7 +2215,7 @@ fn start_impl() -> Result<(), JsValue> {
         }
         set_status(
             &state.document,
-            &state.diagnostics,
+            &state.diagnostics_text,
             "error",
             "Failed to load title_screen.png",
         );

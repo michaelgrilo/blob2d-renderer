@@ -69,11 +69,48 @@
           "Courier New", monospace;
         font-size: 12px;
         line-height: 1.4;
-        white-space: pre-wrap;
         transform-origin: top right;
         transition: opacity 160ms ease, transform 160ms ease;
         z-index: 40;
         pointer-events: auto;
+      }
+
+      #lan-share {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        margin-bottom: 10px;
+        padding-bottom: 10px;
+        border-bottom: 1px solid rgba(142, 196, 255, 0.2);
+      }
+
+      #lan-share[hidden] {
+        display: none;
+      }
+
+      #lan-qr {
+        width: 88px;
+        height: 88px;
+        border-radius: 6px;
+        background: rgba(0, 0, 0, 0.18);
+        border: 1px solid rgba(142, 196, 255, 0.2);
+        image-rendering: pixelated;
+      }
+
+      #lan-url {
+        font-family: "SFMono-Regular", "Menlo", "Monaco", "Consolas", "Liberation Mono",
+          "Courier New", monospace;
+        color: #d4f1ff;
+        font-size: 11px;
+        line-height: 1.35;
+        word-break: break-all;
+      }
+
+      #diagnostics-text {
+        margin: 0;
+        white-space: pre-wrap;
+        font: inherit;
+        color: inherit;
       }
 
       html[data-diag-open="0"] #diagnostics {
@@ -123,9 +160,11 @@
         box-shadow: 0 0 0 3px rgba(255, 196, 142, 0.12);
       }
 
-      #tools-button svg {
-        width: 22px;
-        height: 22px;
+      #tools-button .tool-glyph {
+        font-family: "SFMono-Regular", "Menlo", "Consolas", monospace;
+        font-size: 20px;
+        font-weight: 700;
+        line-height: 1;
       }
 
       #fallback {
@@ -155,26 +194,15 @@
         aria-expanded="false"
         title="Diagnostics"
       >
-        <!-- Oscilloscope icon (diagnostics/instrumentation) -->
-        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-          <path
-            d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v13A2.5 2.5 0 0 1 17.5 21h-11A2.5 2.5 0 0 1 4 18.5v-13Z"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.7"
-            stroke-linejoin="round"
-          />
-          <path
-            d="M6.5 14h2.2l1.1-4.1 2.2 8.2 1.4-5.1h3.1"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.7"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          />
-        </svg>
+        <span class="tool-glyph" aria-hidden="true">?</span>
       </button>
-      <div id="diagnostics" role="status" aria-live="polite">Initializing…</div>
+      <div id="diagnostics" role="status" aria-live="polite">
+        <div id="lan-share" hidden>
+          <img id="lan-qr" alt="LAN share QR code" />
+          <div id="lan-url"></div>
+        </div>
+        <pre id="diagnostics-text">Initializing…</pre>
+      </div>
     </div>
     <div id="fallback" hidden>
       <div>

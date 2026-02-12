@@ -18,7 +18,7 @@ Rust WASM turn-based 1v1 PvP dueling game.
 Use Trunk to build and serve the app:
 
 ```bash
-trunk serve
+trunk serve --address 127.0.0.1 --port 4173 --no-autoreload
 ```
 
 `index.html` includes a `data-trunk` Rust link so Trunk builds the crate to WebAssembly.
@@ -26,6 +26,31 @@ trunk serve
 For stable local visual testing and flicker troubleshooting, use the runbook:
 
 - `docs/development.md`
+
+## HTTPS LAN Dev (Phones + Offline)
+
+To test service-worker offline behavior on phones over LAN, run HTTPS in `tmux`:
+
+```bash
+./scripts/dev_https_start.sh
+```
+
+This prints:
+
+- local URL (`https://127.0.0.1:4173`)
+- LAN URL (`https://<your-lan-ip>:4173`)
+- root CA certificate path (`.tls/bvb-dev-root-ca.crt`)
+
+Stop the server:
+
+```bash
+./scripts/dev_https_stop.sh
+```
+
+Important:
+
+- Phones must trust the local root CA once before HTTPS loads cleanly.
+- Service worker offline on phone/LAN requires secure context (`https://...`), not plain `http://<lan-ip>`.
 
 ## Offline Support (Service Worker)
 
