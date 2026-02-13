@@ -1,4 +1,4 @@
-use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array, WebAssembly};
+use js_sys::{Array, ArrayBuffer, Date, Function, Object, Promise, Reflect, Uint8Array, WebAssembly};
 use qrcodegen::{QrCode, QrCodeEcc};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -45,6 +45,8 @@ const REF_LANE_CENTERS: [f64; 3] = [86.0, 144.0, 202.0];
 const REF_LANE_WIDTH: f64 = 36.0;
 const REF_LANE_TOP: f64 = 108.0;
 const REF_LANE_BOTTOM: f64 = 404.0;
+const FPS_SAMPLE_WINDOW_MS: f64 = 1000.0;
+const DIAGNOSTICS_UPDATE_INTERVAL_MS: f64 = 500.0;
 
 #[derive(Clone, Copy)]
 struct DrawInfo {
@@ -131,12 +133,80 @@ struct AppState {
     gl_vendor: String,
     gl_max_texture_size: i32,
     gl_max_renderbuffer_size: i32,
+    benchmark_mode: bool,
+    fps_window_start_ms: Option<f64>,
+    fps_frames_in_window: u32,
+    last_measured_fps: Option<f64>,
+    fps_over_15_logged: bool,
+    fps_target_met_fps: Option<f64>,
+    diagnostics_last_update_ms: f64,
+    last_uploaded_positions: Option<[f32; 8]>,
+    tex_coords_uploaded: bool,
+    last_viewport_size: Option<(u32, u32)>,
     last_gl_error: Option<String>,
     last_event: String,
 }
 
 fn window() -> Window {
     web_sys::window().expect("missing window")
+}
+
+fn now_ms() -> f64 {
+    Date::now()
+}
+
+fn record_frame_timing(state: &mut AppState, timestamp_ms: f64) {
+    match state.fps_window_start_ms {
+        None => {
+            state.fps_window_start_ms = Some(timestamp_ms);
+            state.fps_frames_in_window = 1;
+            return;
+        }
+        Some(start_ms) => {
+            state.fps_frames_in_window = state.fps_frames_in_window.saturating_add(1);
+            let elapsed_ms = timestamp_ms - start_ms;
+            if elapsed_ms < FPS_SAMPLE_WINDOW_MS {
+                return;
+            }
+
+            let fps = if elapsed_ms > 0.0 {
+                (state.fps_frames_in_window as f64 * 1000.0) / elapsed_ms
+            } else {
+                0.0
+            };
+            state.last_measured_fps = Some(fps);
+            state.fps_window_start_ms = Some(timestamp_ms);
+            state.fps_frames_in_window = 0;
+
+            if state.benchmark_mode {
+                web_sys::console::log_1(&JsValue::from_str(&format!("bench_fps_avg={fps:.2}")));
+            }
+
+            if fps > 15.0 && !state.fps_over_15_logged {
+                state.fps_over_15_logged = true;
+                state.fps_target_met_fps = Some(fps);
+                state.last_event = format!("fps_target_met_{fps:.2}");
+                web_sys::console::log_1(&JsValue::from_str(&format!("perf_target_met_fps={fps:.2}")));
+            }
+        }
+    }
+}
+
+fn maybe_update_diagnostics(state: &mut AppState, timestamp_ms: Option<f64>, force: bool) {
+    let now = timestamp_ms.unwrap_or_else(now_ms);
+    if !force && !state.diagnostics_open && !state.benchmark_mode {
+        return;
+    }
+
+    if !force
+        && state.diagnostics_last_update_ms > 0.0
+        && (now - state.diagnostics_last_update_ms) < DIAGNOSTICS_UPDATE_INTERVAL_MS
+    {
+        return;
+    }
+
+    state.diagnostics_last_update_ms = now;
+    let _ = update_diagnostics(state);
 }
 
 fn should_register_service_worker() -> Result<(), String> {
@@ -1398,7 +1468,10 @@ fn update_geometry(state: &mut AppState) -> Result<(), JsValue> {
         state.canvas.set_height(height);
     }
 
-    state.gl.viewport(0, 0, width as i32, height as i32);
+    if state.last_viewport_size != Some((width, height)) {
+        state.gl.viewport(0, 0, width as i32, height as i32);
+        state.last_viewport_size = Some((width, height));
+    }
 
     let scale_x = (width as f64) / css_width;
     let scale_y = (height as f64) / css_height;
@@ -1453,25 +1526,31 @@ fn update_geometry(state: &mut AppState) -> Result<(), JsValue> {
 
     let tex_coords: [f32; 8] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
 
-    let positions_array = js_sys::Float32Array::from(positions.as_ref());
-    state
-        .gl
-        .bind_buffer(Gl::ARRAY_BUFFER, Some(&state.position_buffer));
-    state.gl.buffer_data_with_array_buffer_view(
-        Gl::ARRAY_BUFFER,
-        &positions_array,
-        Gl::STATIC_DRAW,
-    );
+    if state.last_uploaded_positions != Some(positions) {
+        let positions_array = js_sys::Float32Array::from(positions.as_ref());
+        state
+            .gl
+            .bind_buffer(Gl::ARRAY_BUFFER, Some(&state.position_buffer));
+        state.gl.buffer_data_with_array_buffer_view(
+            Gl::ARRAY_BUFFER,
+            &positions_array,
+            Gl::STATIC_DRAW,
+        );
+        state.last_uploaded_positions = Some(positions);
+    }
 
-    let tex_coords_array = js_sys::Float32Array::from(tex_coords.as_ref());
-    state
-        .gl
-        .bind_buffer(Gl::ARRAY_BUFFER, Some(&state.tex_coord_buffer));
-    state.gl.buffer_data_with_array_buffer_view(
-        Gl::ARRAY_BUFFER,
-        &tex_coords_array,
-        Gl::STATIC_DRAW,
-    );
+    if !state.tex_coords_uploaded {
+        let tex_coords_array = js_sys::Float32Array::from(tex_coords.as_ref());
+        state
+            .gl
+            .bind_buffer(Gl::ARRAY_BUFFER, Some(&state.tex_coord_buffer));
+        state.gl.buffer_data_with_array_buffer_view(
+            Gl::ARRAY_BUFFER,
+            &tex_coords_array,
+            Gl::STATIC_DRAW,
+        );
+        state.tex_coords_uploaded = true;
+    }
 
     state.last_gl_error = gl_check(&state.gl, "update_geometry");
     Ok(())
@@ -1634,7 +1713,28 @@ fn update_diagnostics(state: &AppState) -> Result<(), JsValue> {
     };
 
     let last_gl_error = state.last_gl_error.as_deref().unwrap_or("none").to_string();
-    let (sw_supported, sw_controlled, sw_script_url) = sw_control_status();
+    let (sw_supported_line, sw_controlled_line, sw_script_line) = if state.benchmark_mode {
+        (
+            "(skipped)".to_string(),
+            "(skipped)".to_string(),
+            "(skipped in bench mode)".to_string(),
+        )
+    } else {
+        let (sw_supported, sw_controlled, sw_script_url) = sw_control_status();
+        (
+            sw_supported.to_string(),
+            sw_controlled.to_string(),
+            sw_script_url.unwrap_or_else(|| "(none)".to_string()),
+        )
+    };
+    let fps_line = state
+        .last_measured_fps
+        .map(|fps| format!("{fps:.2}"))
+        .unwrap_or_else(|| "(pending)".to_string());
+    let fps_target_line = state
+        .fps_target_met_fps
+        .map(|fps| format!("{fps:.2}"))
+        .unwrap_or_else(|| "(pending)".to_string());
 
     let lines = [
         format!("status: {}", status),
@@ -1647,6 +1747,10 @@ fn update_diagnostics(state: &AppState) -> Result<(), JsValue> {
         format!("level: {}", level_state_summary(&state.level_state)),
         format!("content: {}x{}", state.content_width, state.content_height),
         format!("context_lost: {}", state.context_lost),
+        format!("benchmark_mode: {}", state.benchmark_mode),
+        format!("fps_avg: {}", fps_line),
+        format!("fps_gt_15_logged: {}", state.fps_over_15_logged),
+        format!("fps_target_met_fps: {}", fps_target_line),
         format!("diagnostics_open: {}", state.diagnostics_open),
         format!(
             "canvas: {}x{} (dpr {:.2})",
@@ -1663,12 +1767,9 @@ fn update_diagnostics(state: &AppState) -> Result<(), JsValue> {
         frame_line,
         "target aspect: 9:16".to_string(),
         "context opts: low-power, no-AA, no-depth".to_string(),
-        format!("sw_supported: {}", sw_supported),
-        format!("sw_controlled: {}", sw_controlled),
-        format!(
-            "sw_script: {}",
-            sw_script_url.unwrap_or_else(|| "(none)".to_string())
-        ),
+        format!("sw_supported: {}", sw_supported_line),
+        format!("sw_controlled: {}", sw_controlled_line),
+        format!("sw_script: {}", sw_script_line),
         format!(
             "limits: max_tex {} max_rb {}",
             state.gl_max_texture_size, state.gl_max_renderbuffer_size
@@ -1681,7 +1782,9 @@ fn update_diagnostics(state: &AppState) -> Result<(), JsValue> {
     ];
 
     state.diagnostics_text.set_text_content(Some(&lines.join("\n")));
-    let _ = update_lan_share_qr(state);
+    if !state.benchmark_mode {
+        let _ = update_lan_share_qr(state);
+    }
 
     Ok(())
 }
@@ -1777,6 +1880,11 @@ fn start_impl() -> Result<(), JsValue> {
 
     let user_agent = win.navigator().user_agent().unwrap_or_default();
     let is_headless = user_agent.to_ascii_lowercase().contains("headless");
+    let benchmark_mode = win
+        .location()
+        .search()
+        .unwrap_or_default()
+        .contains("bench=1");
 
     let program = create_program(&gl, VERTEX_SHADER_SOURCE, FRAGMENT_SHADER_SOURCE)?;
     let position_buffer = gl
@@ -1857,13 +1965,23 @@ fn start_impl() -> Result<(), JsValue> {
         gl_vendor,
         gl_max_texture_size,
         gl_max_renderbuffer_size,
+        benchmark_mode,
+        fps_window_start_ms: None,
+        fps_frames_in_window: 0,
+        last_measured_fps: None,
+        fps_over_15_logged: false,
+        fps_target_met_fps: None,
+        diagnostics_last_update_ms: 0.0,
+        last_uploaded_positions: None,
+        tex_coords_uploaded: false,
+        last_viewport_size: None,
         last_gl_error: None,
         last_event: "init".to_string(),
     }));
 
     {
         let mut state = state.borrow_mut();
-        set_diagnostics_open(&document, &mut state, is_headless);
+        set_diagnostics_open(&document, &mut state, is_headless || benchmark_mode);
         state.last_event = "sw_register_pending".to_string();
         let _ = update_geometry(&mut state);
     }
@@ -1893,9 +2011,11 @@ fn start_impl() -> Result<(), JsValue> {
     toggle.forget();
 
     let raf_holder: Rc<RefCell<Option<Closure<dyn FnMut(f64)>>>> = Rc::new(RefCell::new(None));
+    let schedule_redraw_ref: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
     let schedule_redraw: Rc<dyn Fn()> = {
         let state = Rc::clone(&state);
         let raf_holder = Rc::clone(&raf_holder);
+        let schedule_redraw_ref = Rc::clone(&schedule_redraw_ref);
         Rc::new(move || {
             if raf_holder.borrow().is_some() {
                 return;
@@ -1903,7 +2023,8 @@ fn start_impl() -> Result<(), JsValue> {
 
             let state_cb = Rc::clone(&state);
             let raf_holder_cb = Rc::clone(&raf_holder);
-            let cb = Closure::wrap(Box::new(move |_ts: f64| {
+            let schedule_redraw_ref_cb = Rc::clone(&schedule_redraw_ref);
+            let cb = Closure::wrap(Box::new(move |ts: f64| {
                 raf_holder_cb.borrow_mut().take();
 
                 let mut state = state_cb.borrow_mut();
@@ -1911,9 +2032,20 @@ fn start_impl() -> Result<(), JsValue> {
                     return;
                 }
 
+                record_frame_timing(&mut state, ts);
+
                 if update_geometry(&mut state).is_ok() {
                     render(&mut state);
-                    let _ = update_diagnostics(&state);
+                    maybe_update_diagnostics(&mut state, Some(ts), false);
+                }
+
+                let benchmark_mode = state.benchmark_mode;
+                drop(state);
+
+                if benchmark_mode {
+                    if let Some(schedule_redraw_again) = schedule_redraw_ref_cb.borrow().as_ref() {
+                        schedule_redraw_again();
+                    }
                 }
             }) as Box<dyn FnMut(f64)>);
 
@@ -1925,6 +2057,7 @@ fn start_impl() -> Result<(), JsValue> {
             }
         })
     };
+    *schedule_redraw_ref.borrow_mut() = Some(Rc::clone(&schedule_redraw));
 
     {
         let state_sw = Rc::clone(&state);
