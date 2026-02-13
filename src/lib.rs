@@ -15,6 +15,8 @@ mod wasm_impl {
         sampler: wgpu::Sampler,
         texture: wgpu::Texture,
         texture_bind_group: wgpu::BindGroup,
+        texture_width: u32,
+        texture_height: u32,
     }
 
     impl Renderer {
@@ -173,6 +175,8 @@ mod wasm_impl {
                 sampler,
                 texture,
                 texture_bind_group,
+                texture_width: 1,
+                texture_height: 1,
             })
         }
 
@@ -192,7 +196,7 @@ mod wasm_impl {
         }
 
         pub fn resize(&mut self) {
-            let device_pixel_ratio = window().device_pixel_ratio().max(1.0);
+            let device_pixel_ratio = window().device_pixel_ratio().clamp(1.0, 1.5);
             let width =
                 ((self.canvas.client_width().max(1) as f64) * device_pixel_ratio).round() as u32;
             let height =
@@ -214,18 +218,43 @@ mod wasm_impl {
                 return Err("pasted image has invalid dimensions".to_string());
             }
 
-            let (texture, texture_bind_group) = create_texture_and_bind_group(
-                &self.device,
-                &self.queue,
-                &self.texture_bind_group_layout,
-                &self.sampler,
-                rgba,
-                width,
-                height,
-            );
+            if self.texture_width != width || self.texture_height != height {
+                let (texture, texture_bind_group) = create_texture_and_bind_group(
+                    &self.device,
+                    &self.queue,
+                    &self.texture_bind_group_layout,
+                    &self.sampler,
+                    rgba,
+                    width,
+                    height,
+                );
 
-            self.texture = texture;
-            self.texture_bind_group = texture_bind_group;
+                self.texture = texture;
+                self.texture_bind_group = texture_bind_group;
+                self.texture_width = width;
+                self.texture_height = height;
+                return Ok(());
+            }
+
+            self.queue.write_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * width),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
 
             Ok(())
         }
